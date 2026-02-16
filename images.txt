@@ -1,3 +1,4 @@
+xiaoyaliu/alist
 linuxserver/transmission
 iyuucn/iyuuplus-dev
 linuxserver/qbittorrent
