@@ -1,16 +1,12 @@
-xiaoyaliu/alist
 linuxserver/transmission
 iyuucn/iyuuplus-dev
 linuxserver/qbittorrent
 emby/embyserver
-emby/embyserver:beta
-talebook/talebook
 whyour/qinglong
 xhongc/music_tag_web
 advplyr/audiobookshelf
 6053537/portainer-ce
 deluan/navidrome
-jlesage/firefox
 gdy666/lucky:v2
 lkw199711/smanga-nodejs
 0nlylty/dockercopilot
