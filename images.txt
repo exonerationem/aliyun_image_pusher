@@ -1,7 +1,10 @@
+xiaoyaliu/alist
 linuxserver/transmission
 iyuucn/iyuuplus-dev
 linuxserver/qbittorrent
 emby/embyserver
+emby/embyserver:beta
+talebook/talebook
 whyour/qinglong
 xhongc/music_tag_web
 advplyr/audiobookshelf
