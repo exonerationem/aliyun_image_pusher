@@ -17,8 +17,29 @@ env:
 jobs:
   build:
     name: Sync Images
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
+      # 强烈建议在第一步添加验证，确认运行器类型
+      - name: 验证运行器环境
+        run: |
+          echo "=== 运行器环境报告 ==="
+          echo "运行器环境：${{ runner.environment }}"
+          echo "运行器名称：${{ runner.name }}"
+          echo "运行器标签：${{ toJson(runner.labels) }}"
+          
+          # 决定性检查：如果是自托管环境，立即失败
+          if [ "${{ runner.environment }}" == "self-hosted" ]; then
+            echo "❌ 严重错误：检测到自托管运行器 (self-hosted)。"
+            echo "这意味着您的 'ubuntu-latest' 标签仍被某个自托管运行器匹配。"
+            echo "请立即检查并删除您账户下标记为 'ubuntu-latest' 的自托管运行器。"
+            exit 1
+          fi
+          
+          echo "✅ 当前运行于 GitHub 托管的运行器 (${{ runner.os }})。"
+          echo "当前工作目录：$(pwd)"
+          echo "可用磁盘空间："
+          df -h
+          
       - name: Checkout Code
         uses: actions/checkout@v4
 
