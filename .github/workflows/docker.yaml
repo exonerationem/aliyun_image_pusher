@@ -78,7 +78,7 @@ jobs:
           sleep 5
           docker info
       
-      # 6. 同步镜像到阿里云 (简化检查逻辑)
+      # 6. 同步镜像到阿里云 (优化检查顺序)
       - name: Sync and Push to Aliyun
         id: sync_step
         run: |
@@ -201,15 +201,62 @@ jobs:
               # 1. 检查目标镜像是否存在
               echo "检查目标镜像是否存在..."
               if skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
-                  # 目标镜像存在，检查镜像层(Layers)是否相同
-                  echo "目标镜像存在，比较镜像层摘要..."
+                  # 目标镜像存在，首先检查创建时间
+                  echo "目标镜像存在，首先检查创建时间..."
+                  
+                  # 获取源镜像的创建时间
+                  SRC_CREATED=$(skopeo inspect docker://$image --format '{{.Created}}' 2>/dev/null || echo "")
+                  # 获取目标镜像的创建时间
+                  TARGET_CREATED=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Created}}' 2>/dev/null || echo "")
+                  
+                  if [ -n "$SRC_CREATED" ] && [ -n "$TARGET_CREATED" ]; then
+                      # 转换为时间戳比较
+                      SRC_TIMESTAMP=$(date -d "$SRC_CREATED" +%s 2>/dev/null || echo "0")
+                      TARGET_TIMESTAMP=$(date -d "$TARGET_CREATED" +%s 2>/dev/null || echo "0")
+                      
+                      # 如果目标镜像创建时间比源镜像晚或相同（相差在120秒内），则认为是最新
+                      if [ "$TARGET_TIMESTAMP" -ge "$SRC_TIMESTAMP" ] || [ $((SRC_TIMESTAMP - TARGET_TIMESTAMP)) -lt 120 ]; then
+                          # 进一步检查镜像大小，避免误判
+                          SRC_SIZE=$(skopeo inspect docker://$image --format '{{.Size}}' 2>/dev/null || echo "0")
+                          TARGET_SIZE=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Size}}' 2>/dev/null || echo "0")
+                          
+                          # 允许10%的大小差异（压缩、打包差异）
+                          if [ "$SRC_SIZE" != "0" ] && [ "$TARGET_SIZE" != "0" ]; then
+                              SIZE_DIFF=$((SRC_SIZE - TARGET_SIZE))
+                              SIZE_DIFF_PERCENT=$(( SIZE_DIFF * 100 / SRC_SIZE ))
+                              
+                              if [ ${SIZE_DIFF_PERCENT#-} -lt 10 ]; then  # 差异小于10%
+                                  echo "✅ 创建时间相近且大小相似，镜像已是最新版本，跳过: $image_name_tag"
+                                  echo "  源创建时间: $SRC_CREATED ($SRC_TIMESTAMP)"
+                                  echo "  目标创建时间: $TARGET_CREATED ($TARGET_TIMESTAMP)"
+                                  echo "  源大小: $SRC_SIZE, 目标大小: $TARGET_SIZE (差异: $SIZE_DIFF_PERCENT%)"
+                                  SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (时间相近且大小相似)"
+                                  SKIP_COUNT=$((SKIP_COUNT + 1))
+                                  echo ""
+                                  continue
+                              else
+                                  echo "⚠️ 创建时间相近但大小差异较大 ($SIZE_DIFF_PERCENT%)，继续检查镜像层..."
+                              fi
+                          else
+                              echo "✅ 创建时间相近，镜像已是最新版本，跳过: $image_name_tag"
+                              SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (创建时间相近)"
+                              SKIP_COUNT=$((SKIP_COUNT + 1))
+                              echo ""
+                              continue
+                          fi
+                      else
+                          echo "🔄 目标镜像创建时间较早 (差 $((SRC_TIMESTAMP - TARGET_TIMESTAMP)) 秒)，需要同步: $image_name_tag"
+                      fi
+                  else
+                      echo "ℹ️ 无法获取创建时间，检查镜像层..."
+                  fi
+                  
+                  # 如果创建时间检查无法确定，检查镜像层
+                  echo "检查镜像层摘要..."
                   
                   # 获取源镜像的层摘要
-                  echo "获取源镜像层摘要..."
                   SRC_LAYERS=$(skopeo inspect docker://$image --format '{{.Layers}}' 2>/dev/null || echo "")
-                  
                   # 获取目标镜像的层摘要
-                  echo "获取目标镜像层摘要..."
                   TARGET_LAYERS=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Layers}}' 2>/dev/null || echo "")
                   
                   if [ -n "$SRC_LAYERS" ] && [ -n "$TARGET_LAYERS" ]; then
@@ -225,36 +272,11 @@ jobs:
                           continue
                       else
                           echo "🔄 镜像层不同，需要同步: $image_name_tag"
-                          echo "  源镜像层数: $(echo "$SRC_LAYERS" | tr -d '[]' | wc -w)"
-                          echo "  目标镜像层数: $(echo "$TARGET_LAYERS" | tr -d '[]' | wc -w)"
+                          echo "  源镜像层摘要: $(echo "$SRC_LAYERS" | tr -d '[]' | cut -c1-20)..."
+                          echo "  目标镜像层摘要: $(echo "$TARGET_LAYERS" | tr -d '[]' | cut -c1-20)..."
                       fi
                   else
-                      # 无法获取层信息，检查镜像大小和创建时间作为备选方案
-                      echo "无法获取镜像层信息，检查镜像大小和创建时间..."
-                      
-                      SRC_SIZE=$(skopeo inspect docker://$image --format '{{.Size}}' 2>/dev/null || echo "0")
-                      SRC_CREATED=$(skopeo inspect docker://$image --format '{{.Created}}' 2>/dev/null || echo "")
-                      TARGET_SIZE=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Size}}' 2>/dev/null || echo "0")
-                      TARGET_CREATED=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Created}}' 2>/dev/null || echo "")
-                      
-                      if [ "$SRC_SIZE" != "0" ] && [ "$TARGET_SIZE" != "0" ] && [ "$SRC_SIZE" = "$TARGET_SIZE" ] && [ -n "$SRC_CREATED" ] && [ -n "$TARGET_CREATED" ]; then
-                          # 比较创建时间（转换为时间戳）
-                          SRC_TIMESTAMP=$(date -d "$SRC_CREATED" +%s 2>/dev/null || echo "0")
-                          TARGET_TIMESTAMP=$(date -d "$TARGET_CREATED" +%s 2>/dev/null || echo "0")
-                          
-                          # 如果目标镜像创建时间比源镜像晚或相同（相差在60秒内），则认为是最新
-                          if [ "$TARGET_TIMESTAMP" -ge "$SRC_TIMESTAMP" ] || [ $((SRC_TIMESTAMP - TARGET_TIMESTAMP)) -lt 60 ]; then
-                              echo "✅ 镜像大小相同且创建时间相近，跳过: $image_name_tag"
-                              SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (大小相同且创建时间相近)"
-                              SKIP_COUNT=$((SKIP_COUNT + 1))
-                              echo ""
-                              continue
-                          else
-                              echo "🔄 镜像大小相同但创建时间较早，需要同步: $image_name_tag"
-                          fi
-                      else
-                          echo "🔄 无法确定镜像是否相同，出于安全考虑执行同步: $image_name_tag"
-                      fi
+                      echo "🔄 无法获取镜像层信息，出于安全考虑执行同步: $image_name_tag"
                   fi
               else
                   echo "🔄 目标镜像不存在，需要同步: $image_name_tag"
