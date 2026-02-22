@@ -18,7 +18,6 @@ env:
   WEBHOOK_URL: "${{ secrets.WEBHOOK_URL }}" # 在 Secrets 中配置飞书或企微地址
   # 并行处理配置
   MAX_CONCURRENT_JOBS: "5"  # 同时处理的最大镜像数，根据运行器性能调整
-  BATCH_SIZE: "10"          # 每批处理的镜像数，用于中间清理
 
 jobs:
   build:
@@ -156,6 +155,13 @@ jobs:
           done < images.txt
           
           echo "✅ 预处理完成，发现 ${#duplicate_images[@]} 个重名镜像"
+          
+          # 准备镜像列表文件（过滤注释和空行）
+          grep -v '^\s*#' images.txt | grep -v '^\s*$' > /tmp/image_list.txt
+          
+          # 第二步：并行处理镜像
+          echo "=== 开始并行处理镜像 ==="
+          echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
           
           # 定义处理单个镜像的函数
           process_single_image() {
@@ -316,197 +322,176 @@ jobs:
                               if [ $attempt -lt 3 ]; then
                                   sleep $((attempt * 5))
                               fi
-                          done
-                          
-                          if [ "$PUSH_SUCCESS" = false ]; then
-                              echo "  ❌ 推送失败，达到最大重试次数"
-                              echo "FAIL:$image_name_tag:推送失败"
-                              return 1
-                          else
-                              # 清理本地镜像
-                              docker rmi "$image" "$new_image" 2>/dev/null || true
-                              echo "SUCCESS:$image_name_tag"
-                              return 0
                           fi
-                      else
-                          echo "  ❌ 重标记失败"
-                          echo "FAIL:$image_name_tag:重命名失败"
-                          return 1
-                      fi
-                  } > "$log_file" 2>&1
-                  
-                  # 返回日志文件路径
-                  echo "$log_file"
-              }
-              
-              # 导出函数以便 parallel 使用
-              export -f process_single_image
-              export ALIYUN_REGISTRY ALIYUN_NAME_SPACE ALIYUN_REGISTRY_USER ALIYUN_REGISTRY_PASSWORD
-              
-              # 准备镜像列表文件（过滤注释和空行）
-              grep -v '^\s*#' images.txt | grep -v '^\s*$' > /tmp/image_list.txt
-              
-              # 第二步：并行处理镜像
-              echo "=== 开始并行处理镜像 ==="
-              echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
-              
-              # 使用 parallel 并行处理
-              # --joblog 记录作业日志，--progress 显示进度，--tag 标记输出
-              # --retries 3 失败重试3次，--timeout 1800 单个作业超时30分钟
-              parallel --joblog /tmp/sync_results/joblog.txt \
-                      --progress \
-                      --tag \
-                      --retries 3 \
-                      --timeout 1800 \
-                      --jobs "$MAX_CONCURRENT_JOBS" \
-                      --bar \
-                      'process_single_image "{1}" "{#}" "'"$TOTAL_IMAGES"'" "{#}"' :::: /tmp/image_list.txt
-              
-              echo "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
-              echo "=== 并行处理完成 ==="
-              
-              # 第三步：汇总结果
-              echo "=== 汇总处理结果 ==="
-              
-              # 收集所有日志文件
-              SUCCESS_COUNT=0
-              FAILURE_COUNT=0
-              SKIP_COUNT=0
-              SYNC_SUMMARY=""
-              
-              # 从作业日志中提取结果
-              if [ -f /tmp/sync_results/joblog.txt ]; then
-                  # 成功数（Exitval 为 0）
-                  SUCCESS_COUNT=$(awk '$7==0 {count++} END {print count}' /tmp/sync_results/joblog.txt)
-                  # 失败数（Exitval 不为 0）
-                  FAILURE_COUNT=$(awk '$7!=0 {count++} END {print count}' /tmp/sync_results/joblog.txt)
-              fi
-              
-              # 从日志文件中提取详细结果
-              for log_file in /tmp/sync_logs/*.log; do
-                  if [ -f "$log_file" ]; then
-                      # 提取最后几行结果
-                      last_lines=$(tail -10 "$log_file")
+                      done
                       
-                      if echo "$last_lines" | grep -q "^SUCCESS:"; then
-                          img_name=$(echo "$last_lines" | grep "^SUCCESS:" | cut -d: -f2-)
-                          SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $img_name"
-                      elif echo "$last_lines" | grep -q "^SKIP:"; then
-                          img_name=$(echo "$last_lines" | grep "^SKIP:" | cut -d: -f2-)
-                          SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $img_name"
-                          SKIP_COUNT=$((SKIP_COUNT + 1))
-                      elif echo "$last_lines" | grep -q "^FAIL:"; then
-                          img_name=$(echo "$last_lines" | grep "^FAIL:" | cut -d: -f2-)
-                          SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $img_name"
+                      if [ "$PUSH_SUCCESS" = false ]; then
+                          echo "  ❌ 推送失败，达到最大重试次数"
+                          echo "FAIL:$image_name_tag:推送失败"
+                          return 1
+                      else
+                          # 清理本地镜像
+                          docker rmi "$image" "$new_image" 2>/dev/null || true
+                          echo "SUCCESS:$image_name_tag"
+                          return 0
                       fi
-                  fi
-              done
-              
-              # 如果从日志文件提取失败，使用作业日志
-              if [ $SUCCESS_COUNT -eq 0 ] && [ -f /tmp/sync_results/joblog.txt ]; then
-                  SUCCESS_COUNT=$(grep -c "SUCCESS" /tmp/sync_results/joblog.txt || echo "0")
-                  FAILURE_COUNT=$(grep -c "FAIL" /tmp/sync_results/joblog.txt || echo "0")
-                  SKIP_COUNT=$(grep -c "SKIP" /tmp/sync_results/joblog.txt || echo "0")
-              fi
-              
-              echo "📊 统计结果:"
-              echo "  成功: $SUCCESS_COUNT"
-              echo "  跳过: $SKIP_COUNT"
-              echo "  失败: $FAILURE_COUNT"
-              
-              # 写入环境变量
-              echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
-              echo "FAILURE_COUNT=$FAILURE_COUNT" >> $GITHUB_ENV
-              echo "SKIP_COUNT=$SKIP_COUNT" >> $GITHUB_ENV
-              {
-                echo 'SYNC_RESULT<<EOF'
-                if [ -n "$SYNC_SUMMARY" ]; then
-                    echo -e "$SYNC_SUMMARY"
-                else
-                    echo "本次没有需要同步的新镜像"
-                fi
-                echo 'EOF'
-              } >> $GITHUB_ENV
-              
-              # 显示作业日志摘要
-              echo "=== 作业日志摘要 ==="
-              if [ -f /tmp/sync_results/joblog.txt ]; then
-                  tail -20 /tmp/sync_results/joblog.txt
-              fi
-          
-          # 7. 清理 Docker 系统
-          - name: Clean up Docker system
-            if: always()
-            run: |
-              echo "=== 清理 Docker 系统 ==="
-              docker system prune -af 2>/dev/null || true
-              docker builder prune -af 2>/dev/null || true
-              docker volume prune -f 2>/dev/null || true
-              echo "✅ 清理完成"
-              echo "剩余磁盘空间:"
-              df -h
-          
-          # 8. 发送 Webhook 通知
-          - name: 发送 Webhook 通知
-            if: always()
-            run: |
-              if [ -z "${{ secrets.WEBHOOK_URL }}" ]; then
-                echo "⚠️ 未配置 Webhook URL，跳过通知"
-                exit 0
-              fi
-              
-              S_COUNT=${{ env.SUCCESS_COUNT }}
-              F_COUNT=${{ env.FAILURE_COUNT }}
-              K_COUNT=${{ env.SKIP_COUNT }}
-              
-              # 计算处理时间
-              START_TIME=$(date -d "@${{ job.steps.sync_step.outputs.start_time }}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "未知")
-              END_TIME=$(date "+%Y-%m-%d %H:%M:%S")
-              
-              # 1. 判定标题和主状态
-              if [ "$F_COUNT" -gt 0 ]; then
-                  TITLE="❌ 阿里云镜像同步失败"
-                  CONTENT="⚠️ 警告：有 $F_COUNT 个镜像同步出现异常，请及时检查。"
-              elif [ "$S_COUNT" -gt 0 ]; then
-                  TITLE="✅ 阿里云镜像同步成功"
-                  CONTENT="本次新增同步镜像如下："
-              elif [ "$K_COUNT" -gt 0 ]; then
-                  TITLE="⏭️ 同步任务完成 (镜像已是最新)"
-                  CONTENT="所有镜像已是最新版本，无需同步。"
-              else
-                  TITLE="☕ 同步任务完成 (无镜像需要处理)"
-                  CONTENT="检测到 images.txt 中无有效镜像需要处理。"
-              fi
-              
-              # 2. 组装最终文本
-              RAW_TEXT=$(cat <<EOF
-              $TITLE
-              ━━━━━━━━━━━━━━━━
-              $CONTENT
-              ${{ env.SYNC_RESULT }}
-              
-              📊 统计: 成功 $S_COUNT | 跳过 $K_COUNT | 失败 $F_COUNT
-              ⚡ 并行: ${{ env.MAX_CONCURRENT_JOBS }} 个并发
-              📅 开始: $START_TIME
-              📅 结束: $END_TIME
-              🔗 详情: [查看 GitHub Action 日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-              EOF
-              )
-              
-              # 3. 发送通知
-              echo "发送 Webhook 通知..."
-              JSON_PAYLOAD=$(jq -n --arg msg "$RAW_TEXT" '{"msg_type":"text","content":{"text":$msg}}')
-              
-              # 尝试发送，最多重试3次
-              for i in {1..3}; do
-                  if curl -s -X POST -H "Content-Type: application/json" \
-                     -d "$JSON_PAYLOAD" \
-                     -w "HTTP Status: %{http_code}" \
-                     "${{ secrets.WEBHOOK_URL }}" > /dev/null 2>&1; then
-                      echo "✅ 通知发送成功 (尝试 $i 次)"
-                      break
                   else
-                      echo "⚠️ 通知发送失败，第 $i 次尝试"
-                      sleep 2
+                      echo "  ❌ 重标记失败"
+                      echo "FAIL:$image_name_tag:重命名失败"
+                      return 1
                   fi
-              done
+              } > "$log_file" 2>&1
+              
+              # 返回日志文件路径
+              echo "$log_file"
+          }
+          
+          # 导出函数以便 parallel 使用
+          export -f process_single_image
+          export ALIYUN_REGISTRY ALIYUN_NAME_SPACE ALIYUN_REGISTRY_USER ALIYUN_REGISTRY_PASSWORD
+          
+          # 导出关联数组到环境变量（便于子进程使用）
+          for key in "${!duplicate_images[@]}"; do
+              export "duplicate_images_$key=${duplicate_images[$key]}"
+          done
+          
+          # 使用 parallel 并行处理
+          # --joblog 记录作业日志，--progress 显示进度，--tag 标记输出
+          # --retries 3 失败重试3次，--timeout 1800 单个作业超时30分钟
+          parallel --joblog /tmp/sync_results/joblog.txt \
+                  --progress \
+                  --tag \
+                  --retries 3 \
+                  --timeout 1800 \
+                  --jobs "$MAX_CONCURRENT_JOBS" \
+                  --bar \
+                  'process_single_image "{1}" "{#}" "'"$TOTAL_IMAGES"'" "{#}"' :::: /tmp/image_list.txt
+          
+          echo "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "=== 并行处理完成 ==="
+          
+          # 第三步：汇总结果
+          echo "=== 汇总处理结果 ==="
+          
+          # 收集所有日志文件
+          SUCCESS_COUNT=0
+          FAILURE_COUNT=0
+          SKIP_COUNT=0
+          SYNC_SUMMARY=""
+          
+          # 从日志文件中提取详细结果
+          for log_file in /tmp/sync_logs/*.log 2>/dev/null; do
+              if [ -f "$log_file" ]; then
+                  # 提取最后几行结果
+                  if tail -10 "$log_file" | grep -q "^SUCCESS:"; then
+                      img_name=$(tail -10 "$log_file" | grep "^SUCCESS:" | cut -d: -f2-)
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $img_name"
+                      SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                  elif tail -10 "$log_file" | grep -q "^SKIP:"; then
+                      img_name=$(tail -10 "$log_file" | grep "^SKIP:" | cut -d: -f2-)
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $img_name"
+                      SKIP_COUNT=$((SKIP_COUNT + 1))
+                  elif tail -10 "$log_file" | grep -q "^FAIL:"; then
+                      img_name=$(tail -10 "$log_file" | grep "^FAIL:" | cut -d: -f2-)
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $img_name"
+                      FAILURE_COUNT=$((FAILURE_COUNT + 1))
+                  fi
+              fi
+          done
+          
+          echo "📊 统计结果:"
+          echo "  成功: $SUCCESS_COUNT"
+          echo "  跳过: $SKIP_COUNT"
+          echo "  失败: $FAILURE_COUNT"
+          
+          # 写入环境变量
+          echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
+          echo "FAILURE_COUNT=$FAILURE_COUNT" >> $GITHUB_ENV
+          echo "SKIP_COUNT=$SKIP_COUNT" >> $GITHUB_ENV
+          {
+            echo 'SYNC_RESULT<<EOF'
+            if [ -n "$SYNC_SUMMARY" ]; then
+                echo -e "$SYNC_SUMMARY"
+            else
+                echo "本次没有需要同步的新镜像"
+            fi
+            echo 'EOF'
+          } >> $GITHUB_ENV
+          
+          # 显示作业日志摘要
+          echo "=== 作业日志摘要 ==="
+          if [ -f /tmp/sync_results/joblog.txt ]; then
+              tail -20 /tmp/sync_results/joblog.txt
+          fi
+      
+      # 7. 清理 Docker 系统
+      - name: Clean up Docker system
+        if: always()
+        run: |
+          echo "=== 清理 Docker 系统 ==="
+          docker system prune -af 2>/dev/null || true
+          docker builder prune -af 2>/dev/null || true
+          docker volume prune -f 2>/dev/null || true
+          echo "✅ 清理完成"
+          echo "剩余磁盘空间:"
+          df -h
+      
+      # 8. 发送 Webhook 通知
+      - name: 发送 Webhook 通知
+        if: always()
+        run: |
+          if [ -z "${{ secrets.WEBHOOK_URL }}" ]; then
+            echo "⚠️ 未配置 Webhook URL，跳过通知"
+            exit 0
+          fi
+          
+          S_COUNT=${{ env.SUCCESS_COUNT }}
+          F_COUNT=${{ env.FAILURE_COUNT }}
+          K_COUNT=${{ env.SKIP_COUNT }}
+          
+          # 1. 判定标题和主状态
+          if [ "$F_COUNT" -gt 0 ]; then
+              TITLE="❌ 阿里云镜像同步失败"
+              CONTENT="⚠️ 警告：有 $F_COUNT 个镜像同步出现异常，请及时检查。"
+          elif [ "$S_COUNT" -gt 0 ]; then
+              TITLE="✅ 阿里云镜像同步成功"
+              CONTENT="本次新增同步镜像如下："
+          elif [ "$K_COUNT" -gt 0 ]; then
+              TITLE="⏭️ 同步任务完成 (镜像已是最新)"
+              CONTENT="所有镜像已是最新版本，无需同步。"
+          else
+              TITLE="☕ 同步任务完成 (无镜像需要处理)"
+              CONTENT="检测到 images.txt 中无有效镜像需要处理。"
+          fi
+          
+          # 2. 组装最终文本
+          RAW_TEXT=$(cat <<EOF
+          $TITLE
+          ━━━━━━━━━━━━━━━━
+          $CONTENT
+          ${{ env.SYNC_RESULT }}
+          
+          📊 统计: 成功 $S_COUNT | 跳过 $K_COUNT | 失败 $F_COUNT
+          ⚡ 并行: ${{ env.MAX_CONCURRENT_JOBS }} 个并发
+          📅 时间: $(date '+%Y-%m-%d %H:%M:%S')
+          🔗 详情: [查看 GitHub Action 日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+          )
+          
+          # 3. 发送通知
+          echo "发送 Webhook 通知..."
+          JSON_PAYLOAD=$(jq -n --arg msg "$RAW_TEXT" '{"msg_type":"text","content":{"text":$msg}}')
+          
+          # 尝试发送，最多重试3次
+          for i in {1..3}; do
+              if curl -s -X POST -H "Content-Type: application/json" \
+                 -d "$JSON_PAYLOAD" \
+                 -w "HTTP Status: %{http_code}" \
+                 "${{ secrets.WEBHOOK_URL }}" > /dev/null 2>&1; then
+                  echo "✅ 通知发送成功 (尝试 $i 次)"
+                  break
+              else
+                  echo "⚠️ 通知发送失败，第 $i 次尝试"
+                  sleep 2
+              fi
+          done
