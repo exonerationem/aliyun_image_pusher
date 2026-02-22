@@ -61,3 +61,9 @@ msmkls/daoliyu-music
 xkand/fastnet
 gravityle/hyperms:0.0.5
 shanyanwcx/abs-ximalaya
+mysql
+xiaoyaliu/alist
+emby/embyserver:beta
+talebook/talebook
+allanpk716/chinesesubfinder
+samwaf/samwaf
