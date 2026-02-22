@@ -78,7 +78,7 @@ jobs:
           sleep 5
           docker info
       
-      # 6. 同步镜像到阿里云
+      # 6. 同步镜像到阿里云 (支持镜像版本检查)
       - name: Sync and Push to Aliyun
         id: sync_step
         run: |
@@ -90,6 +90,7 @@ jobs:
           SYNC_SUMMARY=""
           SUCCESS_COUNT=0
           FAILURE_COUNT=0
+          SKIP_COUNT=0
           
           # 第一步：预处理，找出重名镜像
           echo "=== 预处理：检测重名镜像 ==="
@@ -194,15 +195,45 @@ jobs:
               echo "命名空间: $name_space"
               echo "重名处理: ${duplicate_images[$image_name]:+是 (使用前缀)}"
               
-              # 检查镜像是否已存在（使用 skopeo）
-              echo "检查镜像是否已存在..."
-              if skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
-                  echo "✅ 镜像已存在，跳过: $image_name_tag"
-                  echo ""
+              # ========== 检查镜像是否需要更新 ==========
+              echo "检查镜像状态..."
+              
+              # 1. 尝试获取源镜像的digest
+              echo "获取源镜像digest..."
+              SRC_DIGEST=""
+              if ! SRC_DIGEST=$(skopeo inspect docker://$image --format '{{.Digest}}' 2>/dev/null); then
+                  echo "❌ 无法获取源镜像digest，可能镜像不存在或需要认证"
+                  SYNC_SUMMARY="${SYNC_SUMMARY}\n⚠️ $image_name_tag (无法获取源镜像信息)"
+                  FAILURE_COUNT=$((FAILURE_COUNT + 1))
                   continue
               fi
               
-              echo "🔄 开始同步镜像..."
+              echo "  源镜像digest: ${SRC_DIGEST:0:32}..."
+              
+              # 2. 尝试获取目标镜像的digest
+              echo "获取目标镜像digest..."
+              TARGET_DIGEST=""
+              if TARGET_DIGEST=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Digest}}' 2>/dev/null); then
+                  # 目标镜像存在，比较digest
+                  echo "  目标镜像digest: ${TARGET_DIGEST:0:32}..."
+                  
+                  if [ "$SRC_DIGEST" = "$TARGET_DIGEST" ]; then
+                      echo "✅ 目标镜像已是最新版本，跳过: $image_name_tag"
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (已是最新版本)"
+                      SKIP_COUNT=$((SKIP_COUNT + 1))
+                      echo ""
+                      continue
+                  else
+                      echo "🔄 目标镜像有更新，需要同步: $image_name_tag"
+                      echo "  源Digest: $SRC_DIGEST"
+                      echo "  目标Digest: $TARGET_DIGEST"
+                  fi
+              else
+                  echo "🔄 目标镜像不存在，需要同步: $image_name_tag"
+              fi
+              # ========== 检查结束 ==========
+              
+              echo "开始同步镜像..."
               
               # 执行同步（带超时和详细日志）
               # 1. 拉取镜像
@@ -247,11 +278,12 @@ jobs:
           done < images.txt
           
           echo "=== 同步完成 ==="
-          echo "成功: $SUCCESS_COUNT, 失败: $FAILURE_COUNT"
+          echo "成功: $SUCCESS_COUNT, 跳过: $SKIP_COUNT, 失败: $FAILURE_COUNT"
           
           # 写入环境变量
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
           echo "FAILURE_COUNT=$FAILURE_COUNT" >> $GITHUB_ENV
+          echo "SKIP_COUNT=$SKIP_COUNT" >> $GITHUB_ENV
           {
             echo 'SYNC_RESULT<<EOF'
             if [ -n "$SYNC_SUMMARY" ]; then
@@ -284,6 +316,7 @@ jobs:
           
           S_COUNT=${{ env.SUCCESS_COUNT }}
           F_COUNT=${{ env.FAILURE_COUNT }}
+          K_COUNT=${{ env.SKIP_COUNT }}
           
           # 1. 判定标题和主状态
           if [ "$F_COUNT" -gt 0 ]; then
@@ -292,10 +325,12 @@ jobs:
           elif [ "$S_COUNT" -gt 0 ]; then
               TITLE="✅ 阿里云镜像同步成功"
               CONTENT="本次新增同步镜像如下："
+          elif [ "$K_COUNT" -gt 0 ]; then
+              TITLE="⏭️ 同步任务完成 (镜像已是最新)"
+              CONTENT="所有镜像已是最新版本，无需同步。"
           else
-              # 如果全是跳过，为了不骚扰，可以选择不发，或者发一条简洁的
-              TITLE="☕ 同步任务完成 (无新镜像)"
-              CONTENT="检测到 images.txt 中暂无新镜像需要同步。"
+              TITLE="☕ 同步任务完成 (无镜像需要处理)"
+              CONTENT="检测到 images.txt 中无有效镜像需要处理。"
           fi
           
           # 2. 组装最终文本
@@ -305,7 +340,7 @@ jobs:
           $CONTENT
           ${{ env.SYNC_RESULT }}
           
-          📊 统计: 成功 $S_COUNT | 失败 $F_COUNT
+          📊 统计: 成功 $S_COUNT | 跳过 $K_COUNT | 失败 $F_COUNT
           📅 时间: $(date '+%Y-%m-%d %H:%M:%S')
           🔗 详情: [查看 GitHub Action 日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           EOF
