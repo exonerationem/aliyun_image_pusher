@@ -78,7 +78,7 @@ jobs:
           sleep 5
           docker info
       
-      # 6. 同步镜像到阿里云 (支持镜像版本检查)
+      # 6. 同步镜像到阿里云 (修复 ACR Digest 问题)
       - name: Sync and Push to Aliyun
         id: sync_step
         run: |
@@ -198,35 +198,41 @@ jobs:
               # ========== 检查镜像是否需要更新 ==========
               echo "检查镜像状态..."
               
-              # 1. 尝试获取源镜像的digest
-              echo "获取源镜像digest..."
-              SRC_DIGEST=""
-              if ! SRC_DIGEST=$(skopeo inspect docker://$image --format '{{.Digest}}' 2>/dev/null); then
-                  echo "❌ 无法获取源镜像digest，可能镜像不存在或需要认证"
-                  SYNC_SUMMARY="${SYNC_SUMMARY}\n⚠️ $image_name_tag (无法获取源镜像信息)"
-                  FAILURE_COUNT=$((FAILURE_COUNT + 1))
-                  continue
-              fi
-              
-              echo "  源镜像digest: ${SRC_DIGEST:0:32}..."
-              
-              # 2. 尝试获取目标镜像的digest
-              echo "获取目标镜像digest..."
-              TARGET_DIGEST=""
-              if TARGET_DIGEST=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Digest}}' 2>/dev/null); then
-                  # 目标镜像存在，比较digest
-                  echo "  目标镜像digest: ${TARGET_DIGEST:0:32}..."
-                  
-                  if [ "$SRC_DIGEST" = "$TARGET_DIGEST" ]; then
-                      echo "✅ 目标镜像已是最新版本，跳过: $image_name_tag"
-                      SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (已是最新版本)"
-                      SKIP_COUNT=$((SKIP_COUNT + 1))
-                      echo ""
+              # 1. 检查目标镜像是否存在
+              echo "检查目标镜像是否存在..."
+              if skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
+                  # 2. 获取源镜像的 Config.Digest（比 .Digest 更稳定）
+                  echo "获取源镜像Config.Digest..."
+                  SRC_CONFIG_DIGEST=""
+                  if ! SRC_CONFIG_DIGEST=$(skopeo inspect docker://$image --format '{{.Config.Digest}}' 2>/dev/null); then
+                      echo "❌ 无法获取源镜像Config.Digest，跳过此镜像"
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n⚠️ $image_name_tag (无法获取源镜像Config.Digest)"
+                      FAILURE_COUNT=$((FAILURE_COUNT + 1))
                       continue
+                  fi
+                  
+                  echo "  源镜像Config.Digest: ${SRC_CONFIG_DIGEST:0:32}..."
+                  
+                  # 3. 获取目标镜像的 Config.Digest
+                  echo "获取目标镜像Config.Digest..."
+                  TARGET_CONFIG_DIGEST=""
+                  if ! TARGET_CONFIG_DIGEST=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Config.Digest}}' 2>/dev/null); then
+                      echo "❌ 无法获取目标镜像Config.Digest，需要同步"
                   else
-                      echo "🔄 目标镜像有更新，需要同步: $image_name_tag"
-                      echo "  源Digest: $SRC_DIGEST"
-                      echo "  目标Digest: $TARGET_DIGEST"
+                      echo "  目标镜像Config.Digest: ${TARGET_CONFIG_DIGEST:0:32}..."
+                      
+                      # 4. 比较 Config.Digest
+                      if [ "$SRC_CONFIG_DIGEST" = "$TARGET_CONFIG_DIGEST" ]; then
+                          echo "✅ 目标镜像Config.Digest相同，跳过: $image_name_tag"
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (已是最新版本)"
+                          SKIP_COUNT=$((SKIP_COUNT + 1))
+                          echo ""
+                          continue
+                      else
+                          echo "🔄 Config.Digest不同，需要同步: $image_name_tag"
+                          echo "  源Config.Digest: $SRC_CONFIG_DIGEST"
+                          echo "  目标Config.Digest: $TARGET_CONFIG_DIGEST"
+                      fi
                   fi
               else
                   echo "🔄 目标镜像不存在，需要同步: $image_name_tag"
