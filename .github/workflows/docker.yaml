@@ -78,7 +78,7 @@ jobs:
           sleep 5
           docker info
       
-      # 6. 同步镜像到阿里云 (并行优化版)
+      # 6. 同步镜像到阿里云 (修复结果收集问题)
       - name: Sync and Push to Aliyun
         id: sync_step
         timeout-minutes: 45
@@ -140,7 +140,7 @@ jobs:
           TOTAL_IMAGES=$(wc -l < /tmp/image_list.txt)
           echo "📊 总共需要处理的镜像数: $TOTAL_IMAGES"
           
-          # 第二步：并行处理镜像
+          # 第二步：定义处理单个镜像的函数
           echo "=== 开始并行处理镜像 ==="
           echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
           
@@ -150,8 +150,9 @@ jobs:
               local line_number="$2"
               local job_id="$3"
               
-              # 创建日志文件
+              # 创建独立的日志和结果文件
               local log_file="/tmp/sync_logs/job_${job_id}.log"
+              local result_file="/tmp/sync_results/job_${job_id}.result"
               
               {
                   echo "=== 处理镜像 [$line_number/$TOTAL_IMAGES] ==="
@@ -225,7 +226,7 @@ jobs:
                               echo "✅ 创建时间相近，镜像已是最新版本，跳过: $image_name_tag"
                               echo "  源创建时间: $SRC_CREATED ($SRC_TIMESTAMP)"
                               echo "  目标创建时间: $TARGET_CREATED ($TARGET_TIMESTAMP)"
-                              echo "RESULT:SKIP:$image_name_tag:创建时间相近"
+                              echo "RESULT:SKIP:$image_name_tag:创建时间相近" > "$result_file"
                               return 0
                           else
                               echo "🔄 目标镜像创建时间较早 (差 $((SRC_TIMESTAMP - TARGET_TIMESTAMP)) 秒)，需要同步: $image_name_tag"
@@ -244,7 +245,7 @@ jobs:
                               
                               if [ "$SRC_CLEANED" = "$TARGET_CLEANED" ]; then
                                   echo "✅ 镜像层相同，镜像已是最新版本，跳过: $image_name_tag"
-                                  echo "RESULT:SKIP:$image_name_tag:镜像层相同"
+                                  echo "RESULT:SKIP:$image_name_tag:镜像层相同" > "$result_file"
                                   return 0
                               else
                                   echo "🔄 镜像层不同，需要同步: $image_name_tag"
@@ -280,7 +281,7 @@ jobs:
                   
                   if [ "$PULL_SUCCESS" = false ]; then
                       echo "  ❌ 拉取失败，达到最大重试次数"
-                      echo "RESULT:FAIL:$image_name_tag:拉取失败"
+                      echo "RESULT:FAIL:$image_name_tag:拉取失败" > "$result_file"
                       return 1
                   fi
                       
@@ -308,25 +309,27 @@ jobs:
                       
                       if [ "$PUSH_SUCCESS" = false ]; then
                           echo "  ❌ 推送失败，达到最大重试次数"
-                          echo "RESULT:FAIL:$image_name_tag:推送失败"
+                          echo "RESULT:FAIL:$image_name_tag:推送失败" > "$result_file"
                           return 1
                       else
                           # 清理本地镜像
                           docker rmi "$image" "$new_image" 2>/dev/null || true
                           docker system prune -f 2>/dev/null || true
                           
-                          echo "RESULT:SUCCESS:$image_name_tag"
+                          echo "RESULT:SUCCESS:$image_name_tag" > "$result_file"
                           return 0
                       fi
                   else
                       echo "  ❌ 重标记失败"
-                      echo "RESULT:FAIL:$image_name_tag:重命名失败"
+                      echo "RESULT:FAIL:$image_name_tag:重命名失败" > "$result_file"
                       return 1
                   fi
               } > "$log_file" 2>&1
               
-              # 返回日志文件路径
-              echo "$log_file"
+              # 确保结果文件存在
+              if [ ! -f "$result_file" ]; then
+                  echo "RESULT:FAIL:$image_name_tag:未返回结果" > "$result_file"
+              fi
           }
           
           # 导出函数以便使用
@@ -342,22 +345,18 @@ jobs:
           # 使用简单的并行处理：后台作业
           MAX_JOBS=3
           job_counter=0
-          RESULT_FILE="/tmp/sync_results.txt"
-          > "$RESULT_FILE"
+          
+          # 清空结果目录
+          rm -f /tmp/sync_results/*.result
           
           while IFS= read -r line; do
               job_counter=$((job_counter + 1))
               
               # 启动后台作业处理镜像
               (
-                  job_log=$(process_single_image "$line" "$job_counter" "$job_counter")
-                  
-                  # 从日志中提取结果
-                  if [ -f "$job_log" ]; then
-                      if tail -10 "$job_log" | grep -q "^RESULT:"; then
-                          tail -10 "$job_log" | grep "^RESULT:" | tail -1 >> "$RESULT_FILE"
-                      fi
-                  fi
+                  echo "🚀 启动作业 $job_counter 处理第 $job_counter 个镜像"
+                  process_single_image "$line" "$job_counter" "$job_counter"
+                  echo "🏁 作业 $job_counter 完成"
               ) &
               
               # 控制并发数
@@ -370,7 +369,7 @@ jobs:
           done < /tmp/image_list.txt
           
           # 等待所有后台作业完成
-          echo "等待所有作业完成..."
+          echo "⏳ 等待所有作业完成..."
           wait
           
           echo "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -385,28 +384,60 @@ jobs:
           SKIP_COUNT=0
           SYNC_SUMMARY=""
           
-          if [ -f "$RESULT_FILE" ]; then
-              while IFS= read -r result_line; do
-                  if [[ "$result_line" == RESULT:SUCCESS:* ]]; then
-                      img_name=$(echo "$result_line" | cut -d: -f3-)
-                      SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $img_name"
-                      SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-                  elif [[ "$result_line" == RESULT:SKIP:* ]]; then
-                      img_name=$(echo "$result_line" | cut -d: -f3-)
-                      SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $img_name"
-                      SKIP_COUNT=$((SKIP_COUNT + 1))
-                  elif [[ "$result_line" == RESULT:FAIL:* ]]; then
-                      img_name=$(echo "$result_line" | cut -d: -f3-)
-                      SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $img_name"
-                      FAILURE_COUNT=$((FAILURE_COUNT + 1))
+          echo "📁 结果文件数量: $(ls /tmp/sync_results/*.result 2>/dev/null | wc -l)"
+          
+          # 读取所有结果文件
+          for result_file in /tmp/sync_results/*.result 2>/dev/null; do
+              if [ -f "$result_file" ]; then
+                  result_line=$(cat "$result_file" 2>/dev/null || echo "")
+                  if [ -n "$result_line" ]; then
+                      if [[ "$result_line" == RESULT:SUCCESS:* ]]; then
+                          img_name=$(echo "$result_line" | cut -d: -f3-)
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $img_name"
+                          SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                      elif [[ "$result_line" == RESULT:SKIP:* ]]; then
+                          img_name=$(echo "$result_line" | cut -d: -f3-)
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $img_name"
+                          SKIP_COUNT=$((SKIP_COUNT + 1))
+                      elif [[ "$result_line" == RESULT:FAIL:* ]]; then
+                          img_name=$(echo "$result_line" | cut -d: -f3-)
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $img_name"
+                          FAILURE_COUNT=$((FAILURE_COUNT + 1))
+                      fi
                   fi
-              done < "$RESULT_FILE"
-          fi
+              fi
+          done
           
           echo "📊 统计结果:"
           echo "  成功: $SUCCESS_COUNT"
           echo "  跳过: $SKIP_COUNT"
           echo "  失败: $FAILURE_COUNT"
+          
+          # 如果没有结果，尝试从日志中提取
+          if [ $SUCCESS_COUNT -eq 0 ] && [ $SKIP_COUNT -eq 0 ] && [ $FAILURE_COUNT -eq 0 ]; then
+              echo "⚠️ 结果文件为空，尝试从日志中提取结果..."
+              
+              for log_file in /tmp/sync_logs/*.log 2>/dev/null; do
+                  if [ -f "$log_file" ]; then
+                      if grep -q "^RESULT:" "$log_file"; then
+                          result_line=$(grep "^RESULT:" "$log_file" | tail -1)
+                          if [[ "$result_line" == RESULT:SUCCESS:* ]]; then
+                              img_name=$(echo "$result_line" | cut -d: -f3-)
+                              SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $img_name"
+                              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                          elif [[ "$result_line" == RESULT:SKIP:* ]]; then
+                              img_name=$(echo "$result_line" | cut -d: -f3-)
+                              SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $img_name"
+                              SKIP_COUNT=$((SKIP_COUNT + 1))
+                          elif [[ "$result_line" == RESULT:FAIL:* ]]; then
+                              img_name=$(echo "$result_line" | cut -d: -f3-)
+                              SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $img_name"
+                              FAILURE_COUNT=$((FAILURE_COUNT + 1))
+                          fi
+                      fi
+                  fi
+              done
+          fi
           
           # 写入环境变量
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
@@ -421,6 +452,10 @@ jobs:
             fi
             echo 'EOF'
           } >> $GITHUB_ENV
+          
+          # 显示处理完成的作业数
+          echo "✅ 已处理作业数: $job_counter"
+          echo "📁 结果文件总数: $(find /tmp/sync_results -name "*.result" 2>/dev/null | wc -l)"
           
           # 如果有失败，返回非零退出码
           if [ "$FAILURE_COUNT" -gt 0 ]; then
