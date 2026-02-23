@@ -1,4 +1,4 @@
-name: Docker Image Sync to Aliyun
+name: Docker Image Sync to Aliyun (Parallel - Fixed)
 
 on:
   workflow_dispatch:
@@ -15,11 +15,11 @@ env:
   ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
-  WEBHOOK_URL: "${{ secrets.WEBHOOK_URL }}" # 在 Secrets 中配置飞书或企微地址
+  WEBHOOK_URL: "${{ secrets.WEBHOOK_URL }}"
 
 jobs:
   build:
-    name: Sync Images
+    name: Sync Images (Parallel)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -34,10 +34,8 @@ jobs:
           echo "运行器名称：${{ runner.name }}"
           echo "运行器标签：${{ toJson(runner.labels) }}"
           
-          # 决定性检查：如果是自托管环境，立即失败
           if [ "${{ runner.environment }}" == "self-hosted" ]; then
             echo "❌ 严重错误：检测到自托管运行器 (self-hosted)。"
-            echo "这意味着您的 'ubuntu-latest' 标签仍被某个自托管运行器匹配。"
             echo "请立即检查并删除您账户下标记为 'ubuntu-latest' 的自托管运行器。"
             exit 1
           fi
@@ -56,9 +54,10 @@ jobs:
         run: |
           echo "=== 安装必需工具 ==="
           sudo apt-get update
-          sudo apt-get install -y skopeo jq
+          sudo apt-get install -y skopeo jq parallel  # 添加 parallel 工具
           echo "✅ skopeo 版本: $(skopeo --version)"
           echo "✅ jq 版本: $(jq --version)"
+          echo "✅ parallel 版本: $(parallel --version | head -1)"
       
       # 4. 最大化构建空间
       - name: Maximize build space
@@ -78,252 +77,223 @@ jobs:
           sleep 5
           docker info
       
-      # 6. 同步镜像到阿里云 (修复结果收集问题)
-      - name: Sync and Push to Aliyun
+      # 6. 登录阿里云
+      - name: Login to Aliyun Registry
+        run: |
+          echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
+          echo "✅ 登录阿里云镜像仓库成功"
+      
+      # 7. 准备并执行并行同步 (核心修复步骤)
+      - name: Parallel Sync and Push to Aliyun
         id: sync_step
         timeout-minutes: 45
         run: |
-          echo "=== 开始并行同步镜像到阿里云 ==="
+          echo "=== 开始并行同步镜像到阿里云 (修复版) ==="
           
-          # 登录阿里云容器镜像服务
-          echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
+          # 创建日志和结果目录
+          mkdir -p /tmp/sync_results /tmp/sync_logs
           
-          # 创建临时目录存放结果
-          mkdir -p /tmp/sync_results
-          mkdir -p /tmp/sync_logs
+          # 第一步：预处理，找出重名镜像，并将结果写入文件
+          echo "=== 预处理：检测重名镜像并生成配置 ==="
           
-          # 第一步：预处理，找出重名镜像
-          echo "=== 预处理：检测重名镜像 ==="
-          declare -A duplicate_images
-          declare -A temp_map
+          # 生成一个文件，每行包含：行号 原始镜像 命名空间 是否重名
+          : > /tmp/image_config.txt
+          declare -A name_space_map
+          declare -A duplicate_check
           
+          line_num=0
           while IFS= read -r line || [ -n "$line" ]; do
+              line_num=$((line_num + 1))
+              
               # 忽略空行与注释
               [[ -z "$line" ]] && continue
               if echo "$line" | grep -q '^\s*#'; then
                   continue
               fi
               
-              # 获取镜像的完整名称
+              # 获取镜像信息
               raw_image=$(echo "$line" | awk '{print $NF}')
-              # 移除 @sha256: 等摘要信息
               image="${raw_image%%@*}"
-              # 获取镜像名:版本号 例如 nginx:1.25.3
               image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-              # 获取命名空间
               name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
               
-              # 如果命名空间为空，使用特定标记
-              if [[ -z "$name_space" ]]; then
-                  name_space="library"
-              fi
+              [[ -z "$name_space" ]] && name_space="library"
               
-              # 获取镜像名（不含标签）例如 nginx
               image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
               
-              # 如果镜像存在于数组中，则检查是否有重名冲突
-              if [[ -n "${temp_map[$image_name]}" ]]; then
-                   # 如果 temp_map 已经存在镜像名，判断是不是同一命名空间
-                   if [[ "${temp_map[$image_name]}" != "$name_space" ]]; then
-                      duplicate_images[$image_name]="true"
-                   fi
+              # 检测重名冲突
+              duplicate="false"
+              if [[ -n "${name_space_map[$image_name]}" ]]; then
+                  if [[ "${name_space_map[$image_name]}" != "$name_space" ]]; then
+                      duplicate="true"
+                      duplicate_check[$image_name]="true"
+                  fi
               else
-                  # 存镜像的命名空间
-                  temp_map[$image_name]="$name_space"
+                  name_space_map[$image_name]="$name_space"
               fi
+              
+              # 如果是已知的重名镜像，但当前命名空间与记录不同，也标记为重名
+              if [[ -n "${duplicate_check[$image_name]}" ]]; then
+                  duplicate="true"
+              fi
+              
+              # 写入配置文件
+              echo "$line_num \"$line\" \"$name_space\" \"$duplicate\"" >> /tmp/image_config.txt
           done < images.txt
           
-          echo "✅ 预处理完成，发现 ${#duplicate_images[@]} 个重名镜像"
+          # 将重名镜像列表写入文件，供处理函数读取
+          for key in "${!duplicate_check[@]}"; do
+              echo "$key" >> /tmp/duplicate_images.txt
+          done
           
-          # 准备镜像列表文件（过滤注释和空行）
-          grep -v '^\s*#' images.txt | grep -v '^\s*$' > /tmp/image_list.txt
-          TOTAL_IMAGES=$(wc -l < /tmp/image_list.txt)
-          echo "📊 总共需要处理的镜像数: $TOTAL_IMAGES"
+          echo "✅ 预处理完成，发现 ${#duplicate_check[@]} 个重名镜像"
+          echo "📊 有效镜像行数: $(wc -l < /tmp/image_config.txt)"
           
-          # 第二步：定义处理单个镜像的函数
-          echo "=== 开始并行处理镜像 ==="
-          echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
-          
-          # 定义处理单个镜像的函数
-          process_single_image() {
-              local line="$1"
-              local line_number="$2"
-              local job_id="$3"
+          # 第二步：定义真正有效的处理函数
+          process_image() {
+              local config_line="$1"
+              local job_id="$2"
               
-              # 创建独立的日志和结果文件
+              # 解析配置行
+              read -r line_num raw_line name_space duplicate <<< $(echo "$config_line" | sed 's/^"//;s/" "/ /g;s/"$//')
+              
               local log_file="/tmp/sync_logs/job_${job_id}.log"
               local result_file="/tmp/sync_results/job_${job_id}.result"
               
               {
-                  echo "=== 处理镜像 [$line_number/$TOTAL_IMAGES] ==="
-                  echo "原始行: $line"
+                  echo "=== 处理作业 $job_id (第 $line_num 行) ==="
+                  echo "原始行: $raw_line"
                   
-                  # 获取原始镜像信息
-                  raw_image=$(echo "$line" | awk '{print $NF}')
-                  # 移除 @sha256: 等摘要信息
+                  # 从原始行获取镜像信息
+                  raw_image=$(echo "$raw_line" | awk '{print $NF}')
                   image="${raw_image%%@*}"
-                  
-                  # 获取镜像名:版本号 例如 nginx:1.25.3
                   image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-                  # 获取命名空间
-                  name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-                  
-                  # 如果命名空间为空，使用特定标记
-                  if [[ -z "$name_space" ]]; then
-                      name_space="library"
-                  fi
-                  
-                  # 获取镜像名（不含标签）例如 nginx
                   image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
                   
-                  # 提取平台架构信息
-                  platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
+                  # 提取平台架构
+                  platform=$(echo "$raw_line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
+                  [[ -n "$platform" ]] && platform_prefix="${platform//\//_}_" || platform_prefix=""
                   
-                  # 如果存在架构信息，将架构信息拼到镜像名称前面
-                  if [ -z "$platform" ]; then
-                      platform_prefix=""
-                  else
-                      platform_prefix="${platform//\//_}_"
-                  fi
-                  
+                  # 确定是否添加命名空间前缀
                   name_space_prefix=""
-                  # 如果镜像名重名且命名空间不同
-                  if [[ -n "${duplicate_images[$image_name]}" ]]; then
-                     # 如果命名空间非空，将命名空间加到前缀
-                     name_space_prefix="${name_space}_"
+                  if [[ "$duplicate" == "true" ]]; then
+                      # 检查是否在重名列表文件中
+                      if grep -q "^${image_name}$" /tmp/duplicate_images.txt 2>/dev/null; then
+                          name_space_prefix="${name_space}_"
+                      fi
                   fi
                   
-                  # 构造目标镜像名称
-                  new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$platform_prefix$name_space_prefix$image_name_tag"
+                  # 构造目标镜像名称 (使用实际变量而非环境变量)
+                  ALIYUN_REGISTRY="$ALIYUN_REGISTRY"
+                  ALIYUN_NAME_SPACE="$ALIYUN_NAME_SPACE"
+                  new_image="${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${platform_prefix}${name_space_prefix}${image_name_tag}"
                   
                   echo "原始镜像: $image"
                   echo "目标镜像: $new_image"
+                  echo "命名空间: $name_space (重复: $duplicate)"
                   echo "平台架构: ${platform:-默认}"
-                  echo "命名空间: $name_space"
-                  echo "重名处理: ${duplicate_images[$image_name]:+是 (使用前缀)}"
                   
-                  # ========== 检查镜像是否需要更新 ==========
+                  # 核心检查步骤 (与稳定版逻辑一致)
                   echo "检查镜像状态..."
                   
                   # 1. 检查目标镜像是否存在
-                  echo "检查目标镜像是否存在..."
                   if skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
-                      # 目标镜像存在，首先检查创建时间
-                      echo "目标镜像存在，检查创建时间..."
-                      
-                      # 获取源镜像的创建时间
+                      # 检查创建时间
                       SRC_CREATED=$(skopeo inspect docker://$image --format '{{.Created}}' 2>/dev/null || echo "")
-                      # 获取目标镜像的创建时间
                       TARGET_CREATED=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Created}}' 2>/dev/null || echo "")
                       
                       if [ -n "$SRC_CREATED" ] && [ -n "$TARGET_CREATED" ]; then
-                          # 转换为时间戳比较
                           SRC_TIMESTAMP=$(date -d "$SRC_CREATED" +%s 2>/dev/null || echo "0")
                           TARGET_TIMESTAMP=$(date -d "$TARGET_CREATED" +%s 2>/dev/null || echo "0")
                           
-                          # 如果目标镜像创建时间比源镜像晚或相同（相差在120秒内），则认为是最新
                           if [ "$TARGET_TIMESTAMP" -ge "$SRC_TIMESTAMP" ] || [ $((SRC_TIMESTAMP - TARGET_TIMESTAMP)) -lt 120 ]; then
-                              echo "✅ 创建时间相近，镜像已是最新版本，跳过: $image_name_tag"
-                              echo "  源创建时间: $SRC_CREATED ($SRC_TIMESTAMP)"
-                              echo "  目标创建时间: $TARGET_CREATED ($TARGET_TIMESTAMP)"
-                              echo "RESULT:SKIP:$image_name_tag:创建时间相近" > "$result_file"
-                              return 0
-                          else
-                              echo "🔄 目标镜像创建时间较早 (差 $((SRC_TIMESTAMP - TARGET_TIMESTAMP)) 秒)，需要同步: $image_name_tag"
-                          fi
-                      else
-                          echo "ℹ️ 无法获取创建时间，检查镜像层..."
-                          
-                          # 检查镜像层作为后备方案
-                          SRC_LAYERS=$(skopeo inspect docker://$image --format '{{.Layers}}' 2>/dev/null || echo "")
-                          TARGET_LAYERS=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Layers}}' 2>/dev/null || echo "")
-                          
-                          if [ -n "$SRC_LAYERS" ] && [ -n "$TARGET_LAYERS" ]; then
-                              # 去除方括号并排序，然后比较
-                              SRC_CLEANED=$(echo "$SRC_LAYERS" | tr -d '[]' | tr ' ' '\n' | sort | tr '\n' ' ' | xargs)
-                              TARGET_CLEANED=$(echo "$TARGET_LAYERS" | tr -d '[]' | tr ' ' '\n' | sort | tr '\n' ' ' | xargs)
+                              # 检查镜像大小
+                              SRC_SIZE=$(skopeo inspect docker://$image --format '{{.Size}}' 2>/dev/null || echo "0")
+                              TARGET_SIZE=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Size}}' 2>/dev/null || echo "0")
                               
-                              if [ "$SRC_CLEANED" = "$TARGET_CLEANED" ]; then
-                                  echo "✅ 镜像层相同，镜像已是最新版本，跳过: $image_name_tag"
-                                  echo "RESULT:SKIP:$image_name_tag:镜像层相同" > "$result_file"
-                                  return 0
+                              if [ "$SRC_SIZE" != "0" ] && [ "$TARGET_SIZE" != "0" ]; then
+                                  SIZE_DIFF=$((SRC_SIZE - TARGET_SIZE))
+                                  SIZE_DIFF_PERCENT=$(( SIZE_DIFF * 100 / SRC_SIZE ))
+                                  
+                                  if [ ${SIZE_DIFF_PERCENT#-} -lt 10 ]; then
+                                      echo "✅ 镜像已是最新版本，跳过: $image_name_tag"
+                                      echo "RESULT:SKIP:$image_name_tag:已是最新" > "$result_file"
+                                      return 0
+                                  fi
                               else
-                                  echo "🔄 镜像层不同，需要同步: $image_name_tag"
+                                  echo "✅ 镜像已是最新版本，跳过: $image_name_tag"
+                                  echo "RESULT:SKIP:$image_name_tag:已是最新" > "$result_file"
+                                  return 0
                               fi
-                          else
-                              echo "🔄 无法获取镜像信息，出于安全考虑执行同步: $image_name_tag"
                           fi
                       fi
-                  else
-                      echo "🔄 目标镜像不存在，需要同步: $image_name_tag"
-                  fi
-                  # ========== 检查结束 ==========
-                  
-                  echo "开始同步镜像..."
-                  
-                  # 执行同步（带超时和详细日志）
-                  # 1. 拉取镜像
-                  echo "步骤 1/3: 拉取源镜像..."
-                  PULL_SUCCESS=false
-                  for attempt in {1..3}; do
-                      echo "  尝试拉取第 $attempt 次..."
-                      if timeout 300 docker pull "$image"; then
-                          echo "  ✅ 拉取成功 (第 $attempt 次尝试)"
-                          PULL_SUCCESS=true
-                          break
-                      else
-                          echo "  ⚠️ 拉取失败 (第 $attempt 次尝试)"
-                          if [ $attempt -lt 3 ]; then
-                              sleep $((attempt * 5))
+                      
+                      # 如果创建时间检查不确定，检查镜像层
+                      SRC_LAYERS=$(skopeo inspect docker://$image --format '{{.Layers}}' 2>/dev/null || echo "")
+                      TARGET_LAYERS=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Layers}}' 2>/dev/null || echo "")
+                      
+                      if [ -n "$SRC_LAYERS" ] && [ -n "$TARGET_LAYERS" ]; then
+                          SRC_CLEANED=$(echo "$SRC_LAYERS" | tr -d '[]' | tr ' ' '\n' | sort | tr '\n' ' ' | xargs)
+                          TARGET_CLEANED=$(echo "$TARGET_LAYERS" | tr -d '[]' | tr ' ' '\n' | sort | tr '\n' ' ' | xargs)
+                          
+                          if [ "$SRC_CLEANED" = "$TARGET_CLEANED" ]; then
+                              echo "✅ 镜像层相同，跳过: $image_name_tag"
+                              echo "RESULT:SKIP:$image_name_tag:镜像层相同" > "$result_file"
+                              return 0
                           fi
+                      fi
+                  fi
+                  
+                  # 需要同步 - 执行实际的拉取、标记、推送操作
+                  echo "🔄 需要同步镜像: $image_name_tag"
+                  
+                  # 拉取镜像
+                  echo "步骤 1/3: 拉取源镜像..."
+                  for attempt in {1..3}; do
+                      if timeout 300 docker pull "$image" 2>&1 | tee -a "$log_file.pull"; then
+                          echo "✅ 拉取成功 (第 $attempt 次尝试)"
+                          break
+                      elif [ $attempt -eq 3 ]; then
+                          echo "❌ 拉取失败，达到最大重试次数"
+                          echo "RESULT:FAIL:$image_name_tag:拉取失败" > "$result_file"
+                          return 1
+                      else
+                          echo "⚠️ 拉取失败，等待重试..."
+                          sleep $((attempt * 5))
                       fi
                   done
                   
-                  if [ "$PULL_SUCCESS" = false ]; then
-                      echo "  ❌ 拉取失败，达到最大重试次数"
-                      echo "RESULT:FAIL:$image_name_tag:拉取失败" > "$result_file"
-                      return 1
-                  fi
-                      
-                  # 2. 重新标记镜像
+                  # 标记镜像
                   echo "步骤 2/3: 重新标记镜像..."
                   if docker tag "$image" "$new_image"; then
-                      echo "  ✅ 重标记成功"
-                      
-                      # 3. 推送到阿里云
-                      echo "步骤 3/3: 推送到阿里云..."
-                      PUSH_SUCCESS=false
-                      for attempt in {1..3}; do
-                          echo "  尝试推送第 $attempt 次..."
-                          if timeout 600 docker push "$new_image"; then
-                              echo "  ✅ 推送成功 (第 $attempt 次尝试)"
-                              PUSH_SUCCESS=true
-                              break
-                          else
-                              echo "  ⚠️ 推送失败 (第 $attempt 次尝试)"
-                              if [ $attempt -lt 3 ]; then
-                                  sleep $((attempt * 5))
-                              fi
-                          fi
-                      done
-                      
-                      if [ "$PUSH_SUCCESS" = false ]; then
-                          echo "  ❌ 推送失败，达到最大重试次数"
-                          echo "RESULT:FAIL:$image_name_tag:推送失败" > "$result_file"
-                          return 1
-                      else
-                          # 清理本地镜像
-                          docker rmi "$image" "$new_image" 2>/dev/null || true
-                          docker system prune -f 2>/dev/null || true
-                          
-                          echo "RESULT:SUCCESS:$image_name_tag" > "$result_file"
-                          return 0
-                      fi
+                      echo "✅ 重标记成功"
                   else
-                      echo "  ❌ 重标记失败"
+                      echo "❌ 重标记失败"
                       echo "RESULT:FAIL:$image_name_tag:重命名失败" > "$result_file"
                       return 1
                   fi
+                  
+                  # 推送镜像
+                  echo "步骤 3/3: 推送到阿里云..."
+                  for attempt in {1..3}; do
+                      if timeout 600 docker push "$new_image" 2>&1 | tee -a "$log_file.push"; then
+                          echo "✅ 推送成功 (第 $attempt 次尝试)"
+                          
+                          # 清理该作业使用的镜像 (避免影响其他作业)
+                          docker rmi "$image" "$new_image" 2>/dev/null || true
+                          
+                          echo "RESULT:SUCCESS:$image_name_tag" > "$result_file"
+                          return 0
+                      elif [ $attempt -eq 3 ]; then
+                          echo "❌ 推送失败，达到最大重试次数"
+                          echo "RESULT:FAIL:$image_name_tag:推送失败" > "$result_file"
+                          return 1
+                      else
+                          echo "⚠️ 推送失败，等待重试..."
+                          sleep $((attempt * 5))
+                      fi
+                  done
+                  
               } > "$log_file" 2>&1
               
               # 确保结果文件存在
@@ -332,121 +302,91 @@ jobs:
               fi
           }
           
-          # 导出函数以便使用
-          export -f process_single_image
+          # 导出函数和必要的环境变量
+          export -f process_image
           export ALIYUN_REGISTRY ALIYUN_NAME_SPACE ALIYUN_REGISTRY_USER ALIYUN_REGISTRY_PASSWORD
-          export TOTAL_IMAGES
           
-          # 将重名镜像信息导出为环境变量
-          for key in "${!duplicate_images[@]}"; do
-              export "duplicate_images_$key=1"
-          done
+          # 第三步：使用 GNU Parallel 进行可靠的并行处理
+          echo "=== 开始并行处理 ==="
+          echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')"
           
-          # 使用简单的并行处理：后台作业
-          MAX_JOBS=3
-          job_counter=0
+          # 清空旧结果
+          rm -f /tmp/sync_results/*.result /tmp/sync_logs/*.log
           
-          # 清空结果目录
-          rm -f /tmp/sync_results/*.result
-          
-          while IFS= read -r line; do
-              job_counter=$((job_counter + 1))
-              
-              # 启动后台作业处理镜像
-              (
-                  echo "🚀 启动作业 $job_counter 处理第 $job_counter 个镜像"
-                  process_single_image "$line" "$job_counter" "$job_counter"
-                  echo "🏁 作业 $job_counter 完成"
-              ) &
-              
-              # 控制并发数
-              running_jobs=$(jobs -r -p | wc -l)
-              while [ $running_jobs -ge $MAX_JOBS ]; do
-                  sleep 1
-                  running_jobs=$(jobs -r -p | wc -l)
-              done
-              
-          done < /tmp/image_list.txt
-          
-          # 等待所有后台作业完成
-          echo "⏳ 等待所有作业完成..."
-          wait
+          # 使用 parallel 处理，每个作业一个CPU核心，最大并发数4
+          # --joblog 记录每个作业的状态，--progress 显示进度
+          # --halt soon,fail=1 表示有1个失败就停止后续作业
+          cat /tmp/image_config.txt | \
+          parallel -j 4 --joblog /tmp/parallel_job.log --progress \
+                  --colsep ' ' process_image "{\1} {\2} {\3} {\4}" "{#}" \
+                  2>&1 | tee /tmp/parallel_output.log
           
           echo "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
           echo "=== 并行处理完成 ==="
           
-          # 第三步：汇总结果
+          # 第四步：汇总结果 (优化版)
           echo "=== 汇总处理结果 ==="
           
-          # 收集所有结果
           SUCCESS_COUNT=0
           FAILURE_COUNT=0
           SKIP_COUNT=0
           SYNC_SUMMARY=""
           
-          # 使用 find 命令安全地获取结果文件列表，即使为空
-          result_files=$(find /tmp/sync_results -name "*.result" 2>/dev/null)
-          echo "📁 找到结果文件数量: $(echo "$result_files" | wc -l)"
-          
-          # 读取所有结果文件
-          if [ -n "$result_files" ]; then
-              while IFS= read -r result_file; do
+          # 从 parallel 作业日志中读取结果
+          if [ -f /tmp/parallel_job.log ]; then
+              echo "📋 Parallel 作业日志摘要:"
+              tail -n +2 /tmp/parallel_job.log | while read -r line; do
+                  job_exit=$(echo "$line" | awk '{print $7}')
+                  job_num=$(echo "$line" | awk '{print $1}')
+                  
+                  result_file="/tmp/sync_results/job_${job_num}.result"
                   if [ -f "$result_file" ]; then
-                      result_line=$(cat "$result_file" 2>/dev/null || echo "")
-                      if [ -n "$result_line" ]; then
-                          if [[ "$result_line" == RESULT:SUCCESS:* ]]; then
-                              img_name=$(echo "$result_line" | cut -d: -f3-)
-                              SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $img_name"
-                              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-                          elif [[ "$result_line" == RESULT:SKIP:* ]]; then
-                              img_name=$(echo "$result_line" | cut -d: -f3-)
-                              SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $img_name"
-                              SKIP_COUNT=$((SKIP_COUNT + 1))
-                          elif [[ "$result_line" == RESULT:FAIL:* ]]; then
-                              img_name=$(echo "$result_line" | cut -d: -f3-)
-                              SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $img_name"
-                              FAILURE_COUNT=$((FAILURE_COUNT + 1))
-                          fi
+                      result_line=$(cat "$result_file" 2>/dev/null | head -1)
+                      if [[ "$result_line" == RESULT:SUCCESS:* ]]; then
+                          img_name=$(echo "$result_line" | cut -d: -f3-)
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $img_name"
+                          SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                      elif [[ "$result_line" == RESULT:SKIP:* ]]; then
+                          img_name=$(echo "$result_line" | cut -d: -f3-)
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $img_name"
+                          SKIP_COUNT=$((SKIP_COUNT + 1))
+                      elif [[ "$result_line" == RESULT:FAIL:* ]]; then
+                          img_name=$(echo "$result_line" | cut -d: -f3-)
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $img_name"
+                          FAILURE_COUNT=$((FAILURE_COUNT + 1))
                       fi
                   fi
-              done <<< "$result_files"
+              done
           fi
           
-          echo "📊 统计结果:"
+          # 备用方案：直接从结果文件读取
+          if [ $SUCCESS_COUNT -eq 0 ] && [ $SKIP_COUNT -eq 0 ] && [ $FAILURE_COUNT -eq 0 ]; then
+              echo "⚠️ 从作业日志未读取到结果，尝试从结果文件读取..."
+              for result_file in /tmp/sync_results/*.result; do
+                  [ -f "$result_file" ] || continue
+                  result_line=$(cat "$result_file" 2>/dev/null | head -1)
+                  if [[ "$result_line" == RESULT:SUCCESS:* ]]; then
+                      img_name=$(echo "$result_line" | cut -d: -f3-)
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $img_name"
+                      SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                  elif [[ "$result_line" == RESULT:SKIP:* ]]; then
+                      img_name=$(echo "$result_line" | cut -d: -f3-)
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $img_name"
+                      SKIP_COUNT=$((SKIP_COUNT + 1))
+                  elif [[ "$result_line" == RESULT:FAIL:* ]]; then
+                      img_name=$(echo "$result_line" | cut -d: -f3-)
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $img_name"
+                      FAILURE_COUNT=$((FAILURE_COUNT + 1))
+                  fi
+              done
+          fi
+          
+          echo "📊 最终统计结果:"
           echo "  成功: $SUCCESS_COUNT"
           echo "  跳过: $SKIP_COUNT"
           echo "  失败: $FAILURE_COUNT"
           
-          # 如果没有结果，尝试从日志中提取
-          if [ $SUCCESS_COUNT -eq 0 ] && [ $SKIP_COUNT -eq 0 ] && [ $FAILURE_COUNT -eq 0 ]; then
-              echo "⚠️ 结果文件为空，尝试从日志中提取结果..."
-              
-              log_files=$(find /tmp/sync_logs -name "*.log" 2>/dev/null)
-              if [ -n "$log_files" ]; then
-                  while IFS= read -r log_file; do
-                      if [ -f "$log_file" ]; then
-                          if grep -q "^RESULT:" "$log_file"; then
-                              result_line=$(grep "^RESULT:" "$log_file" | tail -1)
-                              if [[ "$result_line" == RESULT:SUCCESS:* ]]; then
-                                  img_name=$(echo "$result_line" | cut -d: -f3-)
-                                  SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $img_name"
-                                  SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-                              elif [[ "$result_line" == RESULT:SKIP:* ]]; then
-                                  img_name=$(echo "$result_line" | cut -d: -f3-)
-                                  SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $img_name"
-                                  SKIP_COUNT=$((SKIP_COUNT + 1))
-                              elif [[ "$result_line" == RESULT:FAIL:* ]]; then
-                                  img_name=$(echo "$result_line" | cut -d: -f3-)
-                                  SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $img_name"
-                                  FAILURE_COUNT=$((FAILURE_COUNT + 1))
-                              fi
-                          fi
-                      fi
-                  done <<< "$log_files"
-              fi
-          fi
-          
-          # 写入环境变量
+          # 写入环境变量供后续步骤使用
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
           echo "FAILURE_COUNT=$FAILURE_COUNT" >> $GITHUB_ENV
           echo "SKIP_COUNT=$SKIP_COUNT" >> $GITHUB_ENV
@@ -460,17 +400,16 @@ jobs:
             echo 'EOF'
           } >> $GITHUB_ENV
           
-          # 显示处理完成的作业数
-          echo "✅ 已处理作业数: $job_counter"
-          echo "📁 结果文件总数: $(find /tmp/sync_results -name "*.result" 2>/dev/null | wc -l)"
-          
-          # 如果有失败，返回非零退出码
+          # 检查是否有失败
           if [ "$FAILURE_COUNT" -gt 0 ]; then
-              echo "⚠️ 有 $FAILURE_COUNT 个镜像同步失败"
+              echo "❌ 有 $FAILURE_COUNT 个镜像同步失败，请检查日志"
+              echo "详细日志位置: /tmp/sync_logs/"
               exit 1
+          else
+              echo "✅ 所有镜像处理完成"
           fi
       
-      # 7. 清理 Docker 系统
+      # 8. 清理 Docker 系统
       - name: Clean up Docker system
         if: always()
         run: |
@@ -481,7 +420,7 @@ jobs:
           echo "剩余磁盘空间:"
           df -h
       
-      # 8. 发送 Webhook 通知
+      # 9. 发送 Webhook 通知 (保持不变)
       - name: 发送 Webhook 通知
         if: always()
         run: |
@@ -494,22 +433,20 @@ jobs:
           F_COUNT=${{ env.FAILURE_COUNT }}
           K_COUNT=${{ env.SKIP_COUNT }}
           
-          # 1. 判定标题和主状态
           if [ "$F_COUNT" -gt 0 ]; then
-              TITLE="❌ 阿里云镜像同步失败"
+              TITLE="❌ 阿里云镜像同步失败 (并行版)"
               CONTENT="⚠️ 警告：有 $F_COUNT 个镜像同步出现异常，请及时检查。"
           elif [ "$S_COUNT" -gt 0 ]; then
-              TITLE="✅ 阿里云镜像同步成功"
+              TITLE="✅ 阿里云镜像同步成功 (并行版)"
               CONTENT="本次新增同步镜像如下："
           elif [ "$K_COUNT" -gt 0 ]; then
-              TITLE="⏭️ 同步任务完成 (镜像已是最新)"
+              TITLE="⏭️ 同步任务完成 (并行版 - 镜像已是最新)"
               CONTENT="所有镜像已是最新版本，无需同步。"
           else
-              TITLE="☕ 同步任务完成 (无镜像需要处理)"
+              TITLE="☕ 同步任务完成 (并行版 - 无镜像需要处理)"
               CONTENT="检测到 images.txt 中无有效镜像需要处理。"
           fi
           
-          # 2. 组装最终文本
           RAW_TEXT=$(cat <<EOF
           $TITLE
           ━━━━━━━━━━━━━━━━
@@ -522,11 +459,9 @@ jobs:
           EOF
           )
           
-          # 3. 发送通知
           echo "发送 Webhook 通知..."
           JSON_PAYLOAD=$(jq -n --arg msg "$RAW_TEXT" '{"msg_type":"text","content":{"text":$msg}}')
           
-          # 尝试发送，最多重试3次
           for i in {1..3}; do
               if curl -s -X POST -H "Content-Type: application/json" \
                  -d "$JSON_PAYLOAD" \
