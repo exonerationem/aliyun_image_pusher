@@ -78,7 +78,7 @@ jobs:
           sleep 5
           docker info
       
-      # 6. 同步镜像到阿里云 (优化检查顺序)
+      # 6. 同步镜像到阿里云 (支持镜像版本检查)
       - name: Sync and Push to Aliyun
         id: sync_step
         run: |
@@ -198,85 +198,35 @@ jobs:
               # ========== 检查镜像是否需要更新 ==========
               echo "检查镜像状态..."
               
-              # 1. 检查目标镜像是否存在
-              echo "检查目标镜像是否存在..."
-              if skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
-                  # 目标镜像存在，首先检查创建时间
-                  echo "目标镜像存在，首先检查创建时间..."
+              # 1. 尝试获取源镜像的digest
+              echo "获取源镜像digest..."
+              SRC_DIGEST=""
+              if ! SRC_DIGEST=$(skopeo inspect docker://$image --format '{{.Digest}}' 2>/dev/null); then
+                  echo "❌ 无法获取源镜像digest，可能镜像不存在或需要认证"
+                  SYNC_SUMMARY="${SYNC_SUMMARY}\n⚠️ $image_name_tag (无法获取源镜像信息)"
+                  FAILURE_COUNT=$((FAILURE_COUNT + 1))
+                  continue
+              fi
+              
+              echo "  源镜像digest: ${SRC_DIGEST:0:32}..."
+              
+              # 2. 尝试获取目标镜像的digest
+              echo "获取目标镜像digest..."
+              TARGET_DIGEST=""
+              if TARGET_DIGEST=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Digest}}' 2>/dev/null); then
+                  # 目标镜像存在，比较digest
+                  echo "  目标镜像digest: ${TARGET_DIGEST:0:32}..."
                   
-                  # 获取源镜像的创建时间
-                  SRC_CREATED=$(skopeo inspect docker://$image --format '{{.Created}}' 2>/dev/null || echo "")
-                  # 获取目标镜像的创建时间
-                  TARGET_CREATED=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Created}}' 2>/dev/null || echo "")
-                  
-                  if [ -n "$SRC_CREATED" ] && [ -n "$TARGET_CREATED" ]; then
-                      # 转换为时间戳比较
-                      SRC_TIMESTAMP=$(date -d "$SRC_CREATED" +%s 2>/dev/null || echo "0")
-                      TARGET_TIMESTAMP=$(date -d "$TARGET_CREATED" +%s 2>/dev/null || echo "0")
-                      
-                      # 如果目标镜像创建时间比源镜像晚或相同（相差在120秒内），则认为是最新
-                      if [ "$TARGET_TIMESTAMP" -ge "$SRC_TIMESTAMP" ] || [ $((SRC_TIMESTAMP - TARGET_TIMESTAMP)) -lt 120 ]; then
-                          # 进一步检查镜像大小，避免误判
-                          SRC_SIZE=$(skopeo inspect docker://$image --format '{{.Size}}' 2>/dev/null || echo "0")
-                          TARGET_SIZE=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Size}}' 2>/dev/null || echo "0")
-                          
-                          # 允许10%的大小差异（压缩、打包差异）
-                          if [ "$SRC_SIZE" != "0" ] && [ "$TARGET_SIZE" != "0" ]; then
-                              SIZE_DIFF=$((SRC_SIZE - TARGET_SIZE))
-                              SIZE_DIFF_PERCENT=$(( SIZE_DIFF * 100 / SRC_SIZE ))
-                              
-                              if [ ${SIZE_DIFF_PERCENT#-} -lt 10 ]; then  # 差异小于10%
-                                  echo "✅ 创建时间相近且大小相似，镜像已是最新版本，跳过: $image_name_tag"
-                                  echo "  源创建时间: $SRC_CREATED ($SRC_TIMESTAMP)"
-                                  echo "  目标创建时间: $TARGET_CREATED ($TARGET_TIMESTAMP)"
-                                  echo "  源大小: $SRC_SIZE, 目标大小: $TARGET_SIZE (差异: $SIZE_DIFF_PERCENT%)"
-                                  SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (时间相近且大小相似)"
-                                  SKIP_COUNT=$((SKIP_COUNT + 1))
-                                  echo ""
-                                  continue
-                              else
-                                  echo "⚠️ 创建时间相近但大小差异较大 ($SIZE_DIFF_PERCENT%)，继续检查镜像层..."
-                              fi
-                          else
-                              echo "✅ 创建时间相近，镜像已是最新版本，跳过: $image_name_tag"
-                              SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (创建时间相近)"
-                              SKIP_COUNT=$((SKIP_COUNT + 1))
-                              echo ""
-                              continue
-                          fi
-                      else
-                          echo "🔄 目标镜像创建时间较早 (差 $((SRC_TIMESTAMP - TARGET_TIMESTAMP)) 秒)，需要同步: $image_name_tag"
-                      fi
+                  if [ "$SRC_DIGEST" = "$TARGET_DIGEST" ]; then
+                      echo "✅ 目标镜像已是最新版本，跳过: $image_name_tag"
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (已是最新版本)"
+                      SKIP_COUNT=$((SKIP_COUNT + 1))
+                      echo ""
+                      continue
                   else
-                      echo "ℹ️ 无法获取创建时间，检查镜像层..."
-                  fi
-                  
-                  # 如果创建时间检查无法确定，检查镜像层
-                  echo "检查镜像层摘要..."
-                  
-                  # 获取源镜像的层摘要
-                  SRC_LAYERS=$(skopeo inspect docker://$image --format '{{.Layers}}' 2>/dev/null || echo "")
-                  # 获取目标镜像的层摘要
-                  TARGET_LAYERS=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Layers}}' 2>/dev/null || echo "")
-                  
-                  if [ -n "$SRC_LAYERS" ] && [ -n "$TARGET_LAYERS" ]; then
-                      # 去除方括号并排序，然后比较
-                      SRC_CLEANED=$(echo "$SRC_LAYERS" | tr -d '[]' | tr ' ' '\n' | sort | tr '\n' ' ' | xargs)
-                      TARGET_CLEANED=$(echo "$TARGET_LAYERS" | tr -d '[]' | tr ' ' '\n' | sort | tr '\n' ' ' | xargs)
-                      
-                      if [ "$SRC_CLEANED" = "$TARGET_CLEANED" ]; then
-                          echo "✅ 镜像层相同，镜像已是最新版本，跳过: $image_name_tag"
-                          SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (镜像层相同)"
-                          SKIP_COUNT=$((SKIP_COUNT + 1))
-                          echo ""
-                          continue
-                      else
-                          echo "🔄 镜像层不同，需要同步: $image_name_tag"
-                          echo "  源镜像层摘要: $(echo "$SRC_LAYERS" | tr -d '[]' | cut -c1-20)..."
-                          echo "  目标镜像层摘要: $(echo "$TARGET_LAYERS" | tr -d '[]' | cut -c1-20)..."
-                      fi
-                  else
-                      echo "🔄 无法获取镜像层信息，出于安全考虑执行同步: $image_name_tag"
+                      echo "🔄 目标镜像有更新，需要同步: $image_name_tag"
+                      echo "  源Digest: $SRC_DIGEST"
+                      echo "  目标Digest: $TARGET_DIGEST"
                   fi
               else
                   echo "🔄 目标镜像不存在，需要同步: $image_name_tag"
