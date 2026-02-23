@@ -94,7 +94,6 @@ jobs:
           # 清空之前的记录文件
           > /tmp/need_sync.txt
           > /tmp/check_results.txt
-          > /tmp/check_summary.txt
           
           # 记录总镜像数、需要同步数、跳过数
           TOTAL_COUNT=0
@@ -106,20 +105,46 @@ jobs:
           declare -A duplicate_images
           declare -A temp_map
           
-          # 先读取images.txt统计总行数（包括注释和空行）
+          # 创建一个临时文件存储有效的镜像行
+          > /tmp/valid_images.txt
+          
+          # 读取images.txt，跳过空行和注释，同时记录原始行号
+          line_number=0
           while IFS= read -r line || [ -n "$line" ]; do
-              # 忽略空行与注释
-              [[ -z "$line" ]] && continue
-              if echo "$line" | grep -q '^\s*#'; then
+              line_number=$((line_number + 1))
+              
+              # 去除首尾空格
+              line_trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              
+              # 跳过空行和注释行
+              if [[ -z "$line_trimmed" ]]; then
                   continue
               fi
               
+              if [[ "$line_trimmed" =~ ^# ]]; then
+                  continue
+              fi
+              
+              # 记录有效镜像行和行号
+              echo "$line_number|$line_trimmed" >> /tmp/valid_images.txt
               TOTAL_COUNT=$((TOTAL_COUNT + 1))
               
-              # 获取镜像的完整名称
-              raw_image=$(echo "$line" | awk '{print $NF}')
+              # 解析镜像信息用于检测重名
+              # 处理可能的参数（如--platform）
+              source_image=""
+              platform=""
+              
+              # 简单的参数解析
+              if echo "$line_trimmed" | grep -q " --platform "; then
+                  source_image=$(echo "$line_trimmed" | awk -F' --platform ' '{print $1}' | xargs)
+                  platform=$(echo "$line_trimmed" | awk -F' --platform ' '{print $2}' | xargs)
+              else
+                  source_image="$line_trimmed"
+              fi
+              
               # 移除 @sha256: 等摘要信息
-              image="${raw_image%%@*}"
+              image="${source_image%%@*}"
+              
               # 获取镜像名:版本号 例如 nginx:1.25.3
               image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
               # 获取命名空间
@@ -150,22 +175,28 @@ jobs:
           
           # 第二步：创建检查函数
           check_single_image() {
-              local line="$1"
-              local line_number="$2"
+              local line_info="$1"
               
-              # 忽略空行与注释
-              [[ -z "$line" ]] && return
-              if echo "$line" | grep -q '^\s*#'; then
-                  echo "📝 第 $line_number 行: 跳过注释行" >> /tmp/check_results.txt
-                  return
-              fi
+              # 拆分行号和镜像行
+              IFS='|' read -r line_number line_trimmed <<< "$line_info"
               
               echo "=== 检查第 $line_number 行 ==="
+              echo "镜像行: $line_trimmed"
               
-              # 获取原始镜像信息
-              raw_image=$(echo "$line" | awk '{print $NF}')
+              # 解析镜像和平台参数
+              source_image=""
+              platform=""
+              
+              # 处理可能的参数（如--platform）
+              if echo "$line_trimmed" | grep -q " --platform "; then
+                  source_image=$(echo "$line_trimmed" | awk -F' --platform ' '{print $1}' | xargs)
+                  platform=$(echo "$line_trimmed" | awk -F' --platform ' '{print $2}' | xargs)
+              else
+                  source_image="$line_trimmed"
+              fi
+              
               # 移除 @sha256: 等摘要信息
-              image="${raw_image%%@*}"
+              image="${source_image%%@*}"
               
               # 获取镜像名:版本号 例如 nginx:1.25.3
               image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
@@ -179,9 +210,6 @@ jobs:
               
               # 获取镜像名（不含标签）例如 nginx
               image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-              
-              # 提取平台架构信息
-              platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
               
               # 如果存在架构信息，将架构信息拼到镜像名称前面
               if [ -z "$platform" ]; then
@@ -224,7 +252,7 @@ jobs:
                       # 比较时间戳：如果Docker Hub的镜像创建时间晚于阿里云的镜像创建时间，则需要同步
                       if [ "$SRC_TIMESTAMP" -gt "$TARGET_TIMESTAMP" ]; then
                           echo "🔄 需要同步: $image_name_tag (源镜像较新)"
-                          echo "$image|$new_image|$image_name_tag" >> /tmp/need_sync.txt
+                          echo "$image|$new_image|$image_name_tag|$line_number" >> /tmp/need_sync.txt
                           echo "第 $line_number 行: $image_name_tag (需要同步 - 源镜像较新)" >> /tmp/check_results.txt
                       elif [ "$SRC_TIMESTAMP" -eq "$TARGET_TIMESTAMP" ]; then
                           echo "✅ 跳过: $image_name_tag (创建时间相同)"
@@ -236,13 +264,13 @@ jobs:
                   else
                       # 无法获取创建时间，需要同步
                       echo "🔄 需要同步: $image_name_tag (无法获取创建时间)"
-                      echo "$image|$new_image|$image_name_tag" >> /tmp/need_sync.txt
+                      echo "$image|$new_image|$image_name_tag|$line_number" >> /tmp/need_sync.txt
                       echo "第 $line_number 行: $image_name_tag (需要同步 - 无法获取创建时间)" >> /tmp/check_results.txt
                   fi
               else
                   # 目标镜像不存在，需要同步
                   echo "🔄 需要同步: $image_name_tag (目标镜像不存在)"
-                  echo "$image|$new_image|$image_name_tag" >> /tmp/need_sync.txt
+                  echo "$image|$new_image|$image_name_tag|$line_number" >> /tmp/need_sync.txt
                   echo "第 $line_number 行: $image_name_tag (需要同步 - 目标镜像不存在)" >> /tmp/check_results.txt
               fi
               
@@ -257,22 +285,14 @@ jobs:
           duplicate_images_declare=$(declare -p duplicate_images)
           export duplicate_images_declare
           
-          # 创建临时文件存储镜像行和行号
-          > /tmp/image_lines.txt
-          line_num=0
-          while IFS= read -r line || [ -n "$line" ]; do
-              line_num=$((line_num + 1))
-              echo "$line_num|$line" >> /tmp/image_lines.txt
-          done < images.txt
-          
           echo "=== 开始并行检查镜像状态 (3个并发) ==="
           
           # 使用parallel并行处理，3个并发
           # 注意：这里需要将duplicate_images数组传递给子进程
-          cat /tmp/image_lines.txt | parallel --jobs 3 --colsep '|' '
+          cat /tmp/valid_images.txt | parallel --jobs 3 '
             # 在子shell中重建关联数组
             eval "$duplicate_images_declare"
-            check_single_image "{2}" "{1}"
+            check_single_image "{}"
           '
           
           # 统计结果
@@ -298,7 +318,7 @@ jobs:
           if [ -f /tmp/need_sync.txt ] && [ $NEED_SYNC_COUNT -gt 0 ]; then
               echo ""
               echo "=== 需要同步的镜像列表 ==="
-              awk -F'|' '{print "  " NR ". " $3 " (" $1 ")"}' /tmp/need_sync.txt
+              awk -F'|' '{print "  " NR ". " $3 " (第" $4 "行)"}' /tmp/need_sync.txt
           fi
           
           # 写入环境变量
@@ -329,12 +349,12 @@ jobs:
           
           # 读取需要同步的镜像列表
           sync_index=0
-          while IFS='|' read -r source_image target_image image_name_tag; do
+          while IFS='|' read -r source_image target_image image_name_tag line_number; do
               sync_index=$((sync_index + 1))
               
               echo ""
               echo "========================================"
-              echo "同步 $sync_index/$NEED_SYNC_COUNT: $image_name_tag"
+              echo "同步 $sync_index/$NEED_SYNC_COUNT: $image_name_tag (第$line_number行)"
               echo "========================================"
               echo "原始镜像: $source_image"
               echo "目标镜像: $target_image"
