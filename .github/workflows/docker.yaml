@@ -56,10 +56,9 @@ jobs:
         run: |
           echo "=== 安装必需工具 ==="
           sudo apt-get update
-          sudo apt-get install -y skopeo jq parallel
+          sudo apt-get install -y skopeo jq
           echo "✅ skopeo 版本: $(skopeo --version)"
           echo "✅ jq 版本: $(jq --version)"
-          echo "✅ parallel 版本: $(parallel --version | head -1)"
       
       # 4. 最大化构建空间
       - name: Maximize build space
@@ -79,25 +78,18 @@ jobs:
           sleep 5
           docker info
       
-      # 6. 登录阿里云容器镜像服务
-      - name: Login to Aliyun Container Registry
+      # 6. 同步镜像到阿里云 (优化版本，使用创建时间比较)
+      - name: Sync and Push to Aliyun
+        id: sync_step
         run: |
+          echo "=== 开始同步镜像到阿里云 ==="
+          
+          # 登录阿里云容器镜像服务
           echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
-          echo "✅ 阿里云容器镜像服务登录成功"
-      
-      # 7. 批量检查镜像状态（并行检查）
-      - name: Batch Check Images Status
-        id: check_images
-        run: |
-          echo "=== 批量检查镜像状态 (并行检查) ==="
           
-          # 清空之前的记录文件
-          > /tmp/need_sync.txt
-          > /tmp/check_results.txt
-          
-          # 记录总镜像数、需要同步数、跳过数
-          TOTAL_COUNT=0
-          NEED_SYNC_COUNT=0
+          SYNC_SUMMARY=""
+          SUCCESS_COUNT=0
+          FAILURE_COUNT=0
           SKIP_COUNT=0
           
           # 第一步：预处理，找出重名镜像
@@ -105,46 +97,17 @@ jobs:
           declare -A duplicate_images
           declare -A temp_map
           
-          # 创建一个临时文件存储有效的镜像行
-          > /tmp/valid_images.txt
-          
-          # 读取images.txt，跳过空行和注释，同时记录原始行号
-          line_number=0
           while IFS= read -r line || [ -n "$line" ]; do
-              line_number=$((line_number + 1))
-              
-              # 去除首尾空格
-              line_trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-              
-              # 跳过空行和注释行
-              if [[ -z "$line_trimmed" ]]; then
+              # 忽略空行与注释
+              [[ -z "$line" ]] && continue
+              if echo "$line" | grep -q '^\s*#'; then
                   continue
               fi
               
-              if [[ "$line_trimmed" =~ ^# ]]; then
-                  continue
-              fi
-              
-              # 记录有效镜像行和行号
-              echo "$line_number|$line_trimmed" >> /tmp/valid_images.txt
-              TOTAL_COUNT=$((TOTAL_COUNT + 1))
-              
-              # 解析镜像信息用于检测重名
-              # 处理可能的参数（如--platform）
-              source_image=""
-              platform=""
-              
-              # 简单的参数解析
-              if echo "$line_trimmed" | grep -q " --platform "; then
-                  source_image=$(echo "$line_trimmed" | awk -F' --platform ' '{print $1}' | xargs)
-                  platform=$(echo "$line_trimmed" | awk -F' --platform ' '{print $2}' | xargs)
-              else
-                  source_image="$line_trimmed"
-              fi
-              
+              # 获取镜像的完整名称
+              raw_image=$(echo "$line" | awk '{print $NF}')
               # 移除 @sha256: 等摘要信息
-              image="${source_image%%@*}"
-              
+              image="${raw_image%%@*}"
               # 获取镜像名:版本号 例如 nginx:1.25.3
               image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
               # 获取命名空间
@@ -171,32 +134,27 @@ jobs:
           done < images.txt
           
           echo "✅ 预处理完成，发现 ${#duplicate_images[@]} 个重名镜像"
-          echo "✅ 总共发现 $TOTAL_COUNT 个需要检查的镜像"
           
-          # 第二步：创建检查函数
-          check_single_image() {
-              local line_info="$1"
+          # 第二步：执行同步
+          echo "=== 开始同步镜像 ==="
+          line_number=0
+          
+          while IFS= read -r line || [ -n "$line" ]; do
+              line_number=$((line_number + 1))
               
-              # 拆分行号和镜像行
-              IFS='|' read -r line_number line_trimmed <<< "$line_info"
-              
-              echo "=== 检查第 $line_number 行 ==="
-              echo "镜像行: $line_trimmed"
-              
-              # 解析镜像和平台参数
-              source_image=""
-              platform=""
-              
-              # 处理可能的参数（如--platform）
-              if echo "$line_trimmed" | grep -q " --platform "; then
-                  source_image=$(echo "$line_trimmed" | awk -F' --platform ' '{print $1}' | xargs)
-                  platform=$(echo "$line_trimmed" | awk -F' --platform ' '{print $2}' | xargs)
-              else
-                  source_image="$line_trimmed"
+              # 忽略空行与注释
+              [[ -z "$line" ]] && continue
+              if echo "$line" | grep -q '^\s*#'; then
+                  echo "📝 第 $line_number 行: 跳过注释行"
+                  continue
               fi
               
+              echo "--- 处理第 $line_number 行 ---"
+              
+              # 获取原始镜像信息
+              raw_image=$(echo "$line" | awk '{print $NF}')
               # 移除 @sha256: 等摘要信息
-              image="${source_image%%@*}"
+              image="${raw_image%%@*}"
               
               # 获取镜像名:版本号 例如 nginx:1.25.3
               image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
@@ -210,6 +168,9 @@ jobs:
               
               # 获取镜像名（不含标签）例如 nginx
               image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
+              
+              # 提取平台架构信息
+              platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
               
               # 如果存在架构信息，将架构信息拼到镜像名称前面
               if [ -z "$platform" ]; then
@@ -230,219 +191,129 @@ jobs:
               
               echo "原始镜像: $image"
               echo "目标镜像: $new_image"
+              echo "平台架构: ${platform:-默认}"
+              echo "命名空间: $name_space"
+              echo "重名处理: ${duplicate_images[$image_name]:+是 (使用前缀)}"
               
-              # 检查镜像状态
+              # ========== 检查镜像是否需要更新 ==========
+              echo "检查镜像状态..."
+              
               # 1. 检查目标镜像是否存在
+              echo "检查目标镜像是否存在..."
               if skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
                   # 目标镜像存在，比较镜像创建时间
+                  echo "目标镜像存在，比较镜像创建时间..."
+                  
                   # 获取源镜像的创建时间
+                  echo "获取源镜像创建时间..."
                   SRC_CREATED=$(skopeo inspect docker://$image --format '{{.Created}}' 2>/dev/null || echo "")
                   
                   # 获取目标镜像的创建时间
+                  echo "获取目标镜像创建时间..."
                   TARGET_CREATED=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Created}}' 2>/dev/null || echo "")
                   
                   if [ -n "$SRC_CREATED" ] && [ -n "$TARGET_CREATED" ]; then
                       # 转换为时间戳（Unix时间戳，单位：秒），确保在同一时区（UTC）比较
+                      echo "将创建时间转换为时间戳（UTC）..."
                       SRC_TIMESTAMP=$(date -u -d "$SRC_CREATED" +%s 2>/dev/null || echo "0")
                       TARGET_TIMESTAMP=$(date -u -d "$TARGET_CREATED" +%s 2>/dev/null || echo "0")
                       
                       echo "源镜像创建时间: $SRC_CREATED ($SRC_TIMESTAMP)"
                       echo "目标镜像创建时间: $TARGET_CREATED ($TARGET_TIMESTAMP)"
                       
-                      # 比较时间戳：如果Docker Hub的镜像创建时间晚于阿里云的镜像创建时间，则需要同步
+                      # 比较时间戳：如果Docker Hub的镜像创建时间晚于阿里云的镜像创建时间，则同步
                       if [ "$SRC_TIMESTAMP" -gt "$TARGET_TIMESTAMP" ]; then
-                          echo "🔄 需要同步: $image_name_tag (源镜像较新)"
-                          echo "$image|$new_image|$image_name_tag|$line_number" >> /tmp/need_sync.txt
-                          echo "第 $line_number 行: $image_name_tag (需要同步 - 源镜像较新)" >> /tmp/check_results.txt
+                          echo "🔄 源镜像创建时间更新，需要同步: $image_name_tag"
+                          TIME_DIFF=$((SRC_TIMESTAMP - TARGET_TIMESTAMP))
+                          echo "  时间差: $TIME_DIFF 秒"
                       elif [ "$SRC_TIMESTAMP" -eq "$TARGET_TIMESTAMP" ]; then
-                          echo "✅ 跳过: $image_name_tag (创建时间相同)"
-                          echo "第 $line_number 行: $image_name_tag (跳过 - 创建时间相同)" >> /tmp/check_results.txt
+                          echo "✅ 源镜像与目标镜像创建时间相同，跳过: $image_name_tag"
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (创建时间相同)"
+                          SKIP_COUNT=$((SKIP_COUNT + 1))
+                          echo ""
+                          continue
                       else
-                          echo "✅ 跳过: $image_name_tag (目标镜像已更新)"
-                          echo "第 $line_number 行: $image_name_tag (跳过 - 目标镜像已更新)" >> /tmp/check_results.txt
+                          echo "✅ 源镜像创建时间早于目标镜像，跳过: $image_name_tag"
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (目标镜像已更新)"
+                          SKIP_COUNT=$((SKIP_COUNT + 1))
+                          echo ""
+                          continue
                       fi
                   else
-                      # 无法获取创建时间，需要同步
-                      echo "🔄 需要同步: $image_name_tag (无法获取创建时间)"
-                      echo "$image|$new_image|$image_name_tag|$line_number" >> /tmp/need_sync.txt
-                      echo "第 $line_number 行: $image_name_tag (需要同步 - 无法获取创建时间)" >> /tmp/check_results.txt
+                      # 无法获取创建时间，检查镜像大小作为辅助判断
+                      echo "无法获取创建时间，检查镜像大小..."
+                      SRC_SIZE=$(skopeo inspect docker://$image --format '{{.Size}}' 2>/dev/null || echo "0")
+                      TARGET_SIZE=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Size}}' 2>/dev/null || echo "0")
+                      
+                      echo "源镜像大小: $SRC_SIZE 字节"
+                      echo "目标镜像大小: $TARGET_SIZE 字节"
+                      
+                      if [ "$SRC_SIZE" != "0" ] && [ "$TARGET_SIZE" != "0" ] && [ "$SRC_SIZE" = "$TARGET_SIZE" ]; then
+                          echo "✅ 镜像大小相同，可能已同步，跳过: $image_name_tag"
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n⏭️ $image_name_tag (大小相同)"
+                          SKIP_COUNT=$((SKIP_COUNT + 1))
+                          echo ""
+                          continue
+                      else
+                          echo "🔄 无法确定镜像状态，需要同步: $image_name_tag"
+                      fi
                   fi
               else
-                  # 目标镜像不存在，需要同步
-                  echo "🔄 需要同步: $image_name_tag (目标镜像不存在)"
-                  echo "$image|$new_image|$image_name_tag|$line_number" >> /tmp/need_sync.txt
-                  echo "第 $line_number 行: $image_name_tag (需要同步 - 目标镜像不存在)" >> /tmp/check_results.txt
+                  echo "🔄 目标镜像不存在，需要同步: $image_name_tag"
               fi
+              # ========== 检查结束 ==========
               
-              echo ""
-          }
-          
-          # 导出函数和变量以便在子shell中使用
-          export -f check_single_image
-          export ALIYUN_REGISTRY ALIYUN_NAME_SPACE ALIYUN_REGISTRY_USER ALIYUN_REGISTRY_PASSWORD
-          
-          # 将关联数组转换为字符串以便传递
-          duplicate_images_declare=$(declare -p duplicate_images)
-          export duplicate_images_declare
-          
-          echo "=== 开始并行检查镜像状态 (3个并发) ==="
-          
-          # 使用parallel并行处理，3个并发
-          # 注意：这里需要将duplicate_images数组传递给子进程
-          cat /tmp/valid_images.txt | parallel --jobs 3 '
-            # 在子shell中重建关联数组
-            eval "$duplicate_images_declare"
-            check_single_image "{}"
-          '
-          
-          # 统计结果
-          if [ -f /tmp/need_sync.txt ]; then
-              NEED_SYNC_COUNT=$(wc -l < /tmp/need_sync.txt | tr -d ' ')
-          fi
-          
-          SKIP_COUNT=$((TOTAL_COUNT - NEED_SYNC_COUNT))
-          
-          echo ""
-          echo "=== 检查完成 ==="
-          echo "总镜像数: $TOTAL_COUNT"
-          echo "需要同步: $NEED_SYNC_COUNT"
-          echo "跳过: $SKIP_COUNT"
-          
-          # 输出检查结果
-          if [ -f /tmp/check_results.txt ]; then
-              echo "=== 检查结果摘要 ==="
-              cat /tmp/check_results.txt
-          fi
-          
-          # 输出需要同步的镜像列表
-          if [ -f /tmp/need_sync.txt ] && [ $NEED_SYNC_COUNT -gt 0 ]; then
-              echo ""
-              echo "=== 需要同步的镜像列表 ==="
-              awk -F'|' '{print "  " NR ". " $3 " (第" $4 "行)"}' /tmp/need_sync.txt
-          fi
-          
-          # 写入环境变量
-          echo "TOTAL_COUNT=$TOTAL_COUNT" >> $GITHUB_ENV
-          echo "NEED_SYNC_COUNT=$NEED_SYNC_COUNT" >> $GITHUB_ENV
-          echo "SKIP_COUNT=$SKIP_COUNT" >> $GITHUB_ENV
-      
-      # 8. 串行同步镜像（第二阶段：依次同步需要更新的镜像）
-      - name: Serial Sync Images
-        if: env.NEED_SYNC_COUNT != '0'
-        run: |
-          echo "=== 串行同步需要更新的镜像 ==="
-          echo "需要同步的镜像数量: $NEED_SYNC_COUNT"
-          
-          SYNC_SUMMARY=""
-          SUCCESS_COUNT=0
-          FAILURE_COUNT=0
-          
-          if [ ! -f /tmp/need_sync.txt ] || [ ! -s /tmp/need_sync.txt ]; then
-              echo "⚠️ 没有需要同步的镜像"
-              echo "SUCCESS_COUNT=0" >> $GITHUB_ENV
-              echo "FAILURE_COUNT=0" >> $GITHUB_ENV
-              echo 'SYNC_RESULT<<EOF' >> $GITHUB_ENV
-              echo "没有需要同步的镜像" >> $GITHUB_ENV
-              echo 'EOF' >> $GITHUB_ENV
-              exit 0
-          fi
-          
-          # 读取需要同步的镜像列表
-          sync_index=0
-          while IFS='|' read -r source_image target_image image_name_tag line_number; do
-              sync_index=$((sync_index + 1))
+              echo "开始同步镜像..."
               
-              echo ""
-              echo "========================================"
-              echo "同步 $sync_index/$NEED_SYNC_COUNT: $image_name_tag (第$line_number行)"
-              echo "========================================"
-              echo "原始镜像: $source_image"
-              echo "目标镜像: $target_image"
-              
-              # 执行同步（带重试机制）
-              MAX_RETRIES=2
-              RETRY_DELAY=5
-              sync_success=false
-              
+              # 执行同步（带超时和详细日志）
               # 1. 拉取镜像
-              for i in $(seq 1 $MAX_RETRIES); do
-                  echo "步骤 1/3: 拉取源镜像 (尝试 $i/$MAX_RETRIES)..."
-                  if timeout 300 docker pull "$source_image"; then
-                      sync_success=true
-                      echo "  ✅ 拉取成功"
-                      break
+              echo "步骤 1/3: 拉取源镜像..."
+              if timeout 300 docker pull "$image"; then
+                  echo "  ✅ 拉取成功"
+                  
+                  # 2. 重新标记镜像
+                  echo "步骤 2/3: 重新标记镜像..."
+                  if docker tag "$image" "$new_image"; then
+                      echo "  ✅ 重标记成功"
+                      
+                      # 3. 推送到阿里云
+                      echo "步骤 3/3: 推送到阿里云..."
+                      if timeout 600 docker push "$new_image"; then
+                          echo "  ✅ 推送成功"
+                          
+                          # 清理本地镜像
+                          docker rmi "$image" "$new_image" 2>/dev/null || true
+                          docker system prune -f 2>/dev/null || true
+                          
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $image_name_tag"
+                          SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                          echo "✅ 同步完成: $image_name_tag"
+                      else
+                          echo "  ❌ 推送失败"
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (推送失败)"
+                          FAILURE_COUNT=$((FAILURE_COUNT + 1))
+                      fi
                   else
-                      echo "  ⚠️ 拉取失败，等待 $RETRY_DELAY 秒后重试..."
-                      sleep $RETRY_DELAY
-                      sync_success=false
+                      echo "  ❌ 重标记失败"
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (重命名失败)"
+                      FAILURE_COUNT=$((FAILURE_COUNT + 1))
                   fi
-              done
-              
-              if [ "$sync_success" = false ]; then
-                  echo "  ❌ 拉取失败 (超过最大重试次数)"
+              else
+                  echo "  ❌ 拉取失败"
                   SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (拉取失败)"
                   FAILURE_COUNT=$((FAILURE_COUNT + 1))
-                  echo "❌ 同步失败: $image_name_tag"
-                  continue
               fi
               
-              # 2. 重新标记镜像
-              echo "步骤 2/3: 重新标记镜像..."
-              if docker tag "$source_image" "$target_image"; then
-                  echo "  ✅ 重标记成功"
-                  sync_success=true
-              else
-                  echo "  ❌ 重标记失败"
-                  # 清理已拉取的镜像
-                  docker rmi "$source_image" 2>/dev/null || true
-                  SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (重标记失败)"
-                  FAILURE_COUNT=$((FAILURE_COUNT + 1))
-                  echo "❌ 同步失败: $image_name_tag"
-                  continue
-              fi
-              
-              # 3. 推送到阿里云
-              push_success=false
-              for i in $(seq 1 $MAX_RETRIES); do
-                  echo "步骤 3/3: 推送到阿里云 (尝试 $i/$MAX_RETRIES)..."
-                  if timeout 600 docker push "$target_image"; then
-                      push_success=true
-                      echo "  ✅ 推送成功"
-                      break
-                  else
-                      echo "  ⚠️ 推送失败，等待 $RETRY_DELAY 秒后重试..."
-                      sleep $RETRY_DELAY
-                  fi
-              done
-              
-              # 清理本地镜像
-              docker rmi "$source_image" "$target_image" 2>/dev/null || true
-              
-              if [ "$push_success" = true ]; then
-                  SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $image_name_tag"
-                  SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-                  echo "✅ 同步完成: $image_name_tag"
-              else
-                  SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (推送失败)"
-                  FAILURE_COUNT=$((FAILURE_COUNT + 1))
-                  echo "❌ 同步失败: $image_name_tag"
-              fi
-              
-              # 清理Docker缓存，防止磁盘空间不足
-              if [ $((sync_index % 5)) -eq 0 ] || [ $sync_index -eq $NEED_SYNC_COUNT ]; then
-                  echo "清理Docker缓存..."
-                  docker system prune -f 2>/dev/null || true
-              fi
-              
-          done < /tmp/need_sync.txt
+              echo ""
+          done < images.txt
           
-          echo ""
           echo "=== 同步完成 ==="
-          echo "成功: $SUCCESS_COUNT, 失败: $FAILURE_COUNT"
+          echo "成功: $SUCCESS_COUNT, 跳过: $SKIP_COUNT, 失败: $FAILURE_COUNT"
           
           # 写入环境变量
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
           echo "FAILURE_COUNT=$FAILURE_COUNT" >> $GITHUB_ENV
+          echo "SKIP_COUNT=$SKIP_COUNT" >> $GITHUB_ENV
           {
             echo 'SYNC_RESULT<<EOF'
             if [ -n "$SYNC_SUMMARY" ]; then
@@ -453,19 +324,18 @@ jobs:
             echo 'EOF'
           } >> $GITHUB_ENV
       
-      # 9. 清理 Docker 系统
+      # 7. 清理 Docker 系统
       - name: Clean up Docker system
         if: always()
         run: |
           echo "=== 清理 Docker 系统 ==="
           docker system prune -af 2>/dev/null || true
           docker builder prune -af 2>/dev/null || true
-          docker image prune -af 2>/dev/null || true
           echo "✅ 清理完成"
           echo "剩余磁盘空间:"
           df -h
       
-      # 10. 发送 Webhook 通知
+      # 8. 发送 Webhook 通知
       - name: 发送 Webhook 通知
         if: always()
         run: |
@@ -474,23 +344,18 @@ jobs:
             exit 0
           fi
           
-          S_COUNT=${{ env.SUCCESS_COUNT || 0 }}
-          F_COUNT=${{ env.FAILURE_COUNT || 0 }}
-          K_COUNT=${{ env.SKIP_COUNT || 0 }}
-          T_COUNT=${{ env.TOTAL_COUNT || 0 }}
-          NEED_COUNT=${{ env.NEED_SYNC_COUNT || 0 }}
+          S_COUNT=${{ env.SUCCESS_COUNT }}
+          F_COUNT=${{ env.FAILURE_COUNT }}
+          K_COUNT=${{ env.SKIP_COUNT }}
           
           # 1. 判定标题和主状态
           if [ "$F_COUNT" -gt 0 ]; then
-              TITLE="⚠️ 阿里云镜像同步部分失败"
-              if [ "$F_COUNT" -eq "$NEED_COUNT" ]; then
-                  TITLE="❌ 阿里云镜像同步全部失败"
-              fi
-              CONTENT="警告：有 $F_COUNT 个镜像同步出现异常，请及时检查。"
+              TITLE="❌ 阿里云镜像同步失败"
+              CONTENT="⚠️ 警告：有 $F_COUNT 个镜像同步出现异常，请及时检查。"
           elif [ "$S_COUNT" -gt 0 ]; then
               TITLE="✅ 阿里云镜像同步成功"
               CONTENT="本次新增同步镜像如下："
-          elif [ "$K_COUNT" -gt 0 ] && [ "$T_COUNT" -gt 0 ]; then
+          elif [ "$K_COUNT" -gt 0 ]; then
               TITLE="⏭️ 同步任务完成 (镜像已是最新)"
               CONTENT="基于创建时间比较，所有镜像已是最新版本，无需同步。"
           else
@@ -505,7 +370,7 @@ jobs:
           $CONTENT
           ${{ env.SYNC_RESULT }}
           
-          📊 统计: 总数 $T_COUNT | 需要同步 $NEED_COUNT | 成功 $S_COUNT | 跳过 $K_COUNT | 失败 $F_COUNT
+          📊 统计: 成功 $S_COUNT | 跳过 $K_COUNT | 失败 $F_COUNT
           📅 时间: $(date '+%Y-%m-%d %H:%M:%S')
           🔗 详情: [查看 GitHub Action 日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           EOF
