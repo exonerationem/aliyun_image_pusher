@@ -67,3 +67,6 @@ emby/embyserver:beta
 talebook/talebook
 allanpk716/chinesesubfinder
 samwaf/samwaf
+ghcr.io/homarr-labs/homarr
+mzz2017/v2raya
+80x86/filebrowser
