@@ -70,3 +70,4 @@ samwaf/samwaf
 ghcr.io/homarr-labs/homarr
 mzz2017/v2raya
 80x86/filebrowser
+coracoo/docker2compose
