@@ -37,6 +37,7 @@ aceberg/watchyourports
 youshandefeiyang/allinone
 ionewu/owjdxb
 envyafish/byte-muse
+envyafish/immortal
 ghcr.io/sarperavci/cloudflarebypassforscraping
 linkease/kspeeder
 postgres:16-alpine
