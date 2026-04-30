@@ -62,7 +62,7 @@ yuexuangu/allinone_format
 booklore/booklore
 msmkls/daoliyu-music
 xkand/fastnet
-gravityle/hyperms:0.0.5
+gravityle/hyperms
 shanyanwcx/abs-ximalaya
 mysql
 xiaoyaliu/alist
