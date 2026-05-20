@@ -79,3 +79,7 @@ cloudnas/clouddrive2
 coracoo/docker2compose
 ghcr.io/koodo-reader/koodo-reader:master
 stirlingtools/stirling-pdf
+ghcr.io/setube/vue-xiuxiangame:latest
+ghcr.io/setube/taoyuan:latest
+ghcr.io/setube/idle-wild-my-survival-saga:latest
+kowming/vue-idle-xiuxian:latest
