@@ -83,3 +83,4 @@ ghcr.io/setube/vue-xiuxiangame:latest
 ghcr.io/setube/taoyuan:latest
 ghcr.io/setube/idle-wild-my-survival-saga:latest
 kowming/vue-idle-xiuxian:latest
+dqsq2e2/ting-reader
