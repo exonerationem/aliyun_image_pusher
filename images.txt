@@ -87,3 +87,4 @@ dqsq2e2/ting-reader
 ghcr.io/lzcer/musicpilot
 ghcr.io/freeok/sonovel
 ponphil/litepan:beta
+coracoo/tradis
