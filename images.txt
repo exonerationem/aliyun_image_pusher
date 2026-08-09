@@ -88,3 +88,4 @@ ghcr.io/lzcer/musicpilot
 ghcr.io/freeok/sonovel
 ponphil/litepan:beta
 coracoo/tradis
+songloft/songloft
