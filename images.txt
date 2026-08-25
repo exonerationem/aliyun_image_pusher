@@ -33,6 +33,7 @@ metacubex/mihomo
 mrxianyu/metacubexd-ui
 rehiy/dailyhot
 jxxghp/moviepilot-v2
+jxxghp/moviepilot-v3
 ddsderek/easyimage
 aceberg/watchyourports
 youshandefeiyang/allinone
