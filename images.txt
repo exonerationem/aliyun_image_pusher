@@ -90,3 +90,7 @@ ghcr.io/freeok/sonovel
 ponphil/litepan:beta
 coracoo/tradis
 songloft/songloft
+tinyping/sakuramediabe
+tinyping/siglip2-embed-service:cpu
+qdrant/qdrant:v1.12.4
+winglini/juku
