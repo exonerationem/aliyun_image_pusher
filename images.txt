@@ -95,3 +95,4 @@ tinyping/siglip2-embed-service:cpu
 qdrant/qdrant:v1.12.4
 winglini/juku
 cs920/happy-capy
+wabisabi926/faststrm
