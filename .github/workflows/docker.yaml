@@ -585,9 +585,14 @@ jobs:
           fi
 
           # 2. 组装 Markdown 正文（Server酱 的 desp 支持 Markdown）
+          #    只推 ✨ 新增 / 🚨 失败，⏭️ 跳过项和「本次没有需要同步的新镜像」
+          #    等占位文案一律过滤；SYNC_RESULT 仍保留完整明细供日志使用
           SYNC_LIST=""
           if [ -n "${SYNC_RESULT:-}" ]; then
-              SYNC_LIST=$(printf '%s\n' "$SYNC_RESULT" | sed '/^[[:space:]]*$/d; s/^/- /')
+              # LC_ALL=C 按字节匹配，避免 runner 多字节 locale 差异影响 🚨(4 字节) 的命中
+              SYNC_LIST=$(printf '%s\n' "$SYNC_RESULT" \
+                  | LC_ALL=C grep -E '^(✨|🚨)' \
+                  | sed 's/^/- /' || true)
           fi
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           SC_DESP=$(cat <<EOF
