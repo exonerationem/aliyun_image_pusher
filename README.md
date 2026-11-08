@@ -68,11 +68,13 @@ ghcr.io/homarr-labs/homarr
 
 | 方式 | 触发条件 | 时间 |
 | --- | --- | --- |
-| 定时 | `schedule: '0 10,22 * * *'` | 每天 **UTC 10:00 / 22:00**（北京 **18:00 / 06:00**） |
+| 定时 | `schedule: '17 10,22 * * *'` | 每天 **UTC 10:17 / 22:17**（北京 **18:17 / 06:17**） |
 | 自动 | push 到 `main` 且**只有 `images.txt` 变更** | 提交后立即 |
 | 手动 | `Actions → Docker Image Sync to Aliyun → Run workflow` | 随时 |
 
 ⚠️ **修改 `.github/workflows/docker.yaml` 本身不会触发 CI**（`on.push.paths` 只含 `images.txt`）。改完工作流必须手动 `Run workflow` 验证，否则会出现「提交完没反应」。
+
+**为什么是 `:17` 而不是整点**：GitHub 官方文档说明 `schedule` 按 UTC 执行，且「每小时的开头」属于高负载时段，此时定时事件可能被延迟，排队过久的作业甚至会被直接丢弃。2026-11-08 北京 18:00 那次就整点未触发（当天凌晨的定时也普遍漂移 3~7 小时），改为 UTC 10:17 / 22:17 避开拥堵。GitHub 不保证精确到分钟，实际开始时间仍可能略晚，属正常现象；同步逻辑幂等，晚跑不会重复推送镜像（只会让通知晚到）。
 
 同一时间只会跑一个同步任务（`concurrency: aliyun-image-sync`，`cancel-in-progress: false`）：定时任务运行中手动触发会**排队**，不会打断正在跑的任务。
 
@@ -151,13 +153,15 @@ ACR 个人版上传 zstd 层会返回 `unknown: blob type invalid`。上游 `diy
 
 ## 🔍 每日失败巡检
 
-WorkBuddy 自动化任务「镜像同步失败巡检」每天 **北京时间 07:00** 运行一次，覆盖过去 30 小时内的两次定时运行；**成功时静默，不产生任何报告**：
+WorkBuddy 自动化任务「镜像同步失败巡检」每天 **北京时间 07:00** 运行一次，覆盖过去 30 小时内的两次定时运行（北京 18:17 / 06:17）；**成功时静默，不产生任何报告**：
 
 - 检查 Actions 结论（`failure` / `cancelled` / `timed_out` / `action_required`，以及卡住超过 1 小时的 `in_progress`）；
 - 即使结论是 `success`，也会读日志末尾 `成功: N, 跳过: N, 失败: N` 汇总行，失败数 > 0 同样报警，专门兜住下面的「假绿」；
 - 异常时报告 run id / URL、失败 job/step、失败镜像名、关键日志片段、根因与可执行修复建议。
 
 排查重点包含 ENOSPC、Docker Hub 限流 / 401、skopeo 认证、`ImageOS` / `ImageVersion` 漂移、ACR `blob type invalid`，以及 Server酱 通知步骤是否发送成功（通知失败只发 `::warning::`，不影响同步结论）。
+
+> 若 GitHub 把定时事件延迟到 07:00 之后，该 run 仍落在 30 小时窗口内，会在次日巡检被检出，不会永久漏报。
 
 ## ⚠️ 已知限制
 

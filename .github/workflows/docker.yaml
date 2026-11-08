@@ -3,8 +3,9 @@ name: Docker Image Sync to Aliyun
 on:
   workflow_dispatch:
   schedule:
-    # 每天 UTC 10:00 / 22:00 (即北京时间 18:00 / 06:00) 运行
-    - cron: '0 10,22 * * *'
+    # 每天 UTC 10:17 / 22:17 (即北京时间 18:17 / 06:17) 运行
+    # 刻意错开整点：GitHub Actions 在整点负载最高，schedule 事件可能被延迟甚至丢弃
+    - cron: '17 10,22 * * *'
   push:
     branches: [ main ]
     paths:
