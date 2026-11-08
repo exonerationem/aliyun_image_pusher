@@ -69,4 +69,3 @@ wabisabi926/faststrm
 mdcng/mdc
 dbonline/db_online
 leolitaly/avdb
-hello-world:latest
