@@ -3,9 +3,12 @@
 ## [v2.1.0] - 2026-11-08 (当前版本)
 
 > 通知通道改为 **Server酱 微信推送**，移除从未配置过的飞书 / 企微 Webhook。同步逻辑一行未动。
+> **已合并**：PR #3 squash 合并为 `7c7d67a`（2026-11-08）。
 
 ### 🚀 新增 (Added)
 - **Server酱 通知**：任务结束（`if: always()`）发送一条 Markdown 消息，**每次运行都推**，标题按 job 异常 / 有失败 / 有新增 / 全跳过四种情况动态切换；正文含新增与失败镜像清单、统计、时间戳和可点击的 GitHub 日志链接。
+- **通知正文精简**：`SYNC_RESULT` 只把 `✨` 新增与 `🚨` 失败转成列表项，`⏭️` 跳过项和占位文案一律过滤；过滤用 `LC_ALL=C` 按字节白名单匹配，避免 4 字节 emoji 在多字节 locale 下漏匹配。完整明细仍留在 `SYNC_RESULT` 供日志排查，统计行照旧显示跳过数；全跳过时正文清单为空。
+- **推送明细可核对**：通知步骤在 Action 日志打印「📋 通知明细（仅新增 / 失败）」，不打印 SendKey / URL。
 - **Turbo / Server酱³ 自动适配**：按 `SERVERCHAN_SENDKEY` 前缀选择 `https://sctapi.ftqq.com/{key}.send` 或 `https://{uid}.push.ft07.com/send/{key}.send`，uid 从 `sctp<uid>t…` 解析并做数字校验。
 - **通知成功判定**：以返回 JSON 的 `code == 0` 为准。旧飞书逻辑只看 curl 退出码，HTTP 200 但业务失败会被误判为「发送成功」；现在失败重试 3 次后只发 `::warning::`，不影响 job 结论。
 - **job 异常告警**：新增 `JOB_STATUS` 判断，工作流非 `success` 时推送「🚨 同步任务异常终止」，补齐同步步骤崩溃时的告警盲区。
@@ -13,7 +16,7 @@
 ### 🔧 变更 (Changed)
 - **移除飞书 / 企微渠道**：删除 job 级 `WEBHOOK_URL` 与 `msg_type: text` payload 构造代码。该 Secret 从未配置，无实际影响。
 - **凭据最小暴露**：`SERVERCHAN_SENDKEY` 只放在通知 step 级 `env`，不在 job 级 env 或 shell 脚本里做 `${{ }}` 插值；SendKey 不打印、curl 错误输出丢弃。
-- **正文改 Markdown**：用 `--data-urlencode` 发送 `title` / `desp`，正确处理中文、emoji、换行与链接；`SYNC_RESULT` 转成列表项。不再按字节截断标题（避免切坏中文）。
+- **正文改 Markdown**：用 `--data-urlencode` 发送 `title` / `desp`，正确处理中文、emoji、换行与链接；`SYNC_RESULT` 中仅 `✨` / `🚨` 转成列表项。不再按字节截断标题（避免切坏中文）。
 - 计数变量改用 shell 环境变量加 `${X:-0}` 兜底，去掉 `${{ env.X }}` 插值，减少脚本源码回显与注入面。
 
 ### 🐛 修复 (Fixed)
@@ -21,15 +24,21 @@
 
 ### 📝 文档 (Docs)
 - README：Secrets 表用 `SERVERCHAN_SENDKEY` 替换 `WEBHOOK_URL`；通知章节改写为 Server酱（两种 SendKey、Markdown 正文、5 条/天额度）；移除已修正的「定时注释有误」已知限制。
+- README（合并后补充）：明确正文只列新增 / 失败、跳过项仅在统计体现；新增「每日失败巡检」章节，说明自动化巡检如何兜住「假绿」。
+- 巡检 automation prompt 同步更新：移除已废弃的「飞书 Webhook 通知步骤」排查项，改为 Server酱；删除 rsshub `blob type invalid` 的「长期已知问题」标注（PR #2 已修复，复发按回归处理）；补充通知明细日志的核对方式。
 
 ### ✅ 验证记录
 - 本地以 curl / jq stub 模拟 6 种场景全部通过：Turbo 与 ³ 地址生成、中文标题完整、日志链接存在、`code == 0` 成功、业务失败重试 3 次、未配置 / 格式异常时安全跳过、job 失败标题。
 - YAML 解析通过（8 个 step），全部 `run` 块 `bash -n` 通过。
+- 过滤逻辑本地脚本 3 场景通过：混合输入只留 1 条 `✨` + 1 条 `🚨`、全跳过输出为空、占位文案被过滤。
+- 分支 dispatch **`42463572879`** = `success`（6m50s，9 步骤全绿）：`成功: 0, 跳过: 71, 失败: 0`，日志明细输出「（本次无新增或失败项）」，`✅ Server酱 通知发送成功 (第 1 次)`，真实微信到达且正文无跳过清单。
+- PR #3 合并后 main 与分支 `docker.yaml` 逐行一致（`git diff` 为空）。
 
 ### ⚠️ 已知限制
 - Server酱 免费版 5 条/天；每天 2 次定时约占 2 条额度。
 - 未配置 `SERVERCHAN_SENDKEY` 时静默跳过微信通知，不影响同步。
-- 「假绿」仍在：单个镜像失败不 `exit 1`，判断真实结果请看日志汇总行。
+- 「假绿」仍在：单个镜像失败不 `exit 1`，判断真实结果请看日志汇总行（每日巡检已自动检查该行）。
+- 全跳过时通知正文的镜像清单为空，属预期行为；跳过数量看统计行。
 
 ---
 

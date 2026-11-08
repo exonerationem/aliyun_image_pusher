@@ -16,7 +16,7 @@
 | zstd 自适应 | ACR 个人版不接受 zstd 层，按源清单 `layers[].mediaType` 自动识别并强制转 gzip，不硬编码镜像名 |
 | 凭据隔离 | Docker Hub PAT 只发给 Docker Hub，`ghcr.io` 等第三方源保持匿名 |
 | 固定环境 | `runs-on: ubuntu-24.04` + `actions/checkout@v7`，规避系统镜像漂移与 Node 20 弃用警告 |
-| 通知 | Server酱 微信推送，每次运行发送 Markdown 摘要（含统计与日志链接），Turbo / ³ 自动适配 |
+| 通知 | Server酱 微信推送，每次运行发送 Markdown 摘要（只列新增 / 失败，含统计与日志链接），Turbo / ³ 自动适配 |
 
 ## 🚀 快速开始
 
@@ -133,7 +133,7 @@ ACR 个人版上传 zstd 层会返回 `unknown: blob type invalid`。上游 `diy
 | 有新增同步 | ✅ 阿里云镜像同步成功 |
 | 全部跳过 | ⏭️ 同步完成，镜像已是最新 |
 
-正文是 Markdown（Server酱 的 `desp` 字段），包含新增 / 失败镜像清单、成功 / 跳过 / 失败统计、时间戳和**可点击的 GitHub 日志链接**：
+正文是 Markdown（Server酱 的 `desp` 字段），**只列 ✨ 新增与 🚨 失败镜像**；`⏭️` 跳过项不逐条推送，只在统计里体现一次，避免全跳过时刷出几十行。此外还有成功 / 跳过 / 失败统计、时间戳和**可点击的 GitHub 日志链接**：
 
 > ## ⏭️ 同步完成，镜像已是最新
 >
@@ -144,15 +144,27 @@ ACR 个人版上传 zstd 层会返回 `unknown: blob type invalid`。上游 `diy
 > 📊 **统计**：成功 0 ｜ 跳过 71 ｜ 失败 0
 > 🔗 [查看 GitHub Action 日志](https://github.com/exonerationem/aliyun_image_pusher/actions/runs/...)
 
+有新增或失败时，正文才会出现 `- ✨ xxx` / `- 🚨 xxx (同步失败)` 列表项。Action 日志会同步打印「📋 通知明细（仅新增 / 失败）」便于核对；完整 `SYNC_RESULT`（含全部跳过项）仍保留在日志中供排查。
+
 **两种 SendKey 自动适配**：`SCT` 开头走 Server酱Turbo（`https://sctapi.ftqq.com/{key}.send`）；`sctp` 开头走 Server酱³（自动从 `sctp<uid>t…` 解析 uid，请求 `https://{uid}.push.ft07.com/send/{key}.send`）。不需要手动填地址或区分版本。
 
 > ⚠️ SendKey 会出现在请求 URL 里，不要打印到日志、不要写进代码或提交记录。工作流用 `--data-urlencode` 发送中文 / emoji / Markdown，以返回 JSON 的 `code == 0` 判定成功；失败重试 3 次后只发 `::warning::`，**不影响同步结果**。
 
 未配置 `SERVERCHAN_SENDKEY` 时打印「跳过微信通知」，其余流程不受影响。免费额度 5 条/天，每天 2 次定时 + 偶尔手动触发足够。
 
+## 🔍 每日失败巡检
+
+WorkBuddy 自动化任务「镜像同步失败巡检」每天 **北京时间 07:00** 运行一次，覆盖过去 30 小时内的两次定时运行；**成功时静默，不产生任何报告**：
+
+- 检查 Actions 结论（`failure` / `cancelled` / `timed_out` / `action_required`，以及卡住超过 1 小时的 `in_progress`）；
+- 即使结论是 `success`，也会读日志末尾 `成功: N, 跳过: N, 失败: N` 汇总行，失败数 > 0 同样报警，专门兜住下面的「假绿」；
+- 异常时报告 run id / URL、失败 job/step、失败镜像名、关键日志片段、根因与可执行修复建议。
+
+排查重点包含 ENOSPC、Docker Hub 限流 / 401、skopeo 认证、`ImageOS` / `ImageVersion` 漂移、ACR `blob type invalid`，以及 Server酱 通知步骤是否发送成功（通知失败只发 `::warning::`，不影响同步结论）。
+
 ## ⚠️ 已知限制
 
-- **「假绿」**：单个镜像失败只累加失败计数、不会 `exit 1`，job 结论仍可能是 `success`。判断真实结果请看日志末尾的 `成功: N, 跳过: N, 失败: N` 汇总行。
+- **「假绿」**：单个镜像失败只累加失败计数、不会 `exit 1`，job 结论仍可能是 `success`。判断真实结果请看日志末尾的 `成功: N, 跳过: N, 失败: N` 汇总行（每日巡检已自动做这项检查）。
 - **只同步单架构**：默认 `linux/amd64`；需要 arm64 请在 `images.txt` 用 `--platform` 逐行指定（注意写在行首）。
 - **失败重试有上限**：3 次失败后跳过该镜像，等下一轮再试。
 - **额外网络依赖**：仅 zstd 镜像会拉 `quay.io/skopeo/stable:v1.22.3`。
