@@ -599,9 +599,8 @@ jobs:
           echo "📋 通知明细（仅新增 / 失败）:"
           printf '%s\n' "${SYNC_LIST:-（本次无新增或失败项）}"
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          # title 参数已由 Server酱 单独显示为消息标题，正文不再重复一次标题
           SC_DESP=$(cat <<EOF
-          ## $TITLE
-
           $CONTENT
 
           $SYNC_LIST

@@ -139,9 +139,9 @@ ACR 个人版上传 zstd 层会返回 `unknown: blob type invalid`。上游 `diy
 
 **通知预览**（全跳过场景，2026-11-08 08:42 UTC，run `42463572879`）：
 
-<img src="doc/serverchan-notify.jpg" width="380" alt="Server酱 微信通知预览">
+<img src="doc/serverchan-notify.jpg" width="380" alt="Server酱 微信通知预览（修正前）">
 
-> 截图里标题出现两次是 Server酱 的正常行为：消息标题（`title`）与正文里的 `## $TITLE` 各显示一次。
+> 截图是 **2026-11-08 修正前**的画面：当时 `title` 参数与正文开头的 `## $TITLE` 用了同一句文案，标题会显示两次。现已删掉正文里的重复标题，标题只由 `title` 参数显示一次；截图待下次运行后更新。
 
 有新增或失败时，正文才会出现 `- ✨ xxx` / `- 🚨 xxx (同步失败)` 列表项。Action 日志会同步打印「📋 通知明细（仅新增 / 失败）」便于核对；完整 `SYNC_RESULT`（含全部跳过项）仍保留在日志中供排查。
 
