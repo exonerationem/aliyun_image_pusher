@@ -25,6 +25,7 @@
 ### 📝 文档 (Docs)
 - README：Secrets 表用 `SERVERCHAN_SENDKEY` 替换 `WEBHOOK_URL`；通知章节改写为 Server酱（两种 SendKey、Markdown 正文、5 条/天额度）；移除已修正的「定时注释有误」已知限制。
 - README（合并后补充）：明确正文只列新增 / 失败、跳过项仅在统计体现；新增「每日失败巡检」章节，说明自动化巡检如何兜住「假绿」。
+- README 通知预览改用**真实 Server酱 截图** `doc/serverchan-notify.jpg`（1190×1105，103 KB），替换重写前的旧 Webhook 通知外链图与纯文字示例；图片随仓库走，不再依赖 GitHub `user-attachments` 附件。
 - 巡检 automation prompt 同步更新：移除已废弃的「飞书 Webhook 通知步骤」排查项，改为 Server酱；删除 rsshub `blob type invalid` 的「长期已知问题」标注（PR #2 已修复，复发按回归处理）；补充通知明细日志的核对方式。
 
 ### ✅ 验证记录
