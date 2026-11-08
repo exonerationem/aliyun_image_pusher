@@ -27,7 +27,10 @@ env:
 jobs:
   build:
     name: Sync Images
-    runs-on: ubuntu-latest
+    # ubuntu-latest 正在灰度迁移到 Ubuntu 26.04 (2026-10-19 ~ 11-19)，
+    # 期间同一份 workflow 可能落到 24.04 或 26.04。刚修完磁盘问题，先固定 24.04 求稳；
+    # 想提前验证 26.04，把下面一行改成 runs-on: ubuntu-26.04 即可。
+    runs-on: ubuntu-24.04
     defaults:
       run:
         shell: bash
@@ -40,12 +43,16 @@ jobs:
           echo "运行器环境：${{ runner.environment }}"
           echo "运行器名称：${{ runner.name }}"
           echo "运行器标签：${{ toJson(runner.labels) }}"
+          echo "=== 运行器镜像版本（排查系统漂移） ==="
+          echo "ImageOS=${ImageOS:-未设置} ImageVersion=${ImageVersion:-未设置}"
+          lsb_release -ds 2>/dev/null || true
+          echo "Docker: $(docker --version 2>/dev/null || echo '未安装')"
           
           # 决定性检查：如果是自托管环境，立即失败
           if [ "${{ runner.environment }}" == "self-hosted" ]; then
             echo "❌ 严重错误：检测到自托管运行器 (self-hosted)。"
-            echo "这意味着您的 'ubuntu-latest' 标签仍被某个自托管运行器匹配。"
-            echo "请立即检查并删除您账户下标记为 'ubuntu-latest' 的自托管运行器。"
+            echo "这意味着您指定的运行器标签仍被某个自托管运行器匹配。"
+            echo "请立即检查并删除您账户下同名的自托管运行器。"
             exit 1
           fi
           
@@ -57,7 +64,7 @@ jobs:
       
       # 2. 检出代码
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       
       # 3. 安装必需工具
       - name: Install required tools
@@ -111,12 +118,37 @@ jobs:
           mkdir -p "$TMPBASE"
           export TMPDIR="$TMPBASE"
           echo "skopeo 临时目录: $TMPBASE"
+          echo "=== 临时目录所在磁盘（Ubuntu 26.04 的 /tmp 是内存盘，必须确认） ==="
+          df -h "$TMPBASE"
+          df -i "$TMPBASE" 2>/dev/null || true
+          echo "=== 根盘 ==="
           df -h /
+          df -i /
 
-          SRC_CREDS=()
-          if [[ -n "$DOCKERHUB_USER" && -n "$DOCKERHUB_TOKEN" ]]; then
-              SRC_CREDS=(--src-creds "$DOCKERHUB_USER:$DOCKERHUB_TOKEN")
-          fi
+          # Docker Hub PAT 只能发给 Docker Hub：images.txt 里还有 ghcr.io 等第三方
+          # registry，无差别加 --src-creds 会把凭据发给对方并可能导致认证失败。
+          # 用法: mapfile -t HUB_ARGS < <(hub_creds --creds "$image")       # inspect
+          #       mapfile -t HUB_ARGS < <(hub_creds --src-creds "$image")   # copy
+          hub_creds() {
+              local flag="$1" ref="$2" host
+              [[ -z "$DOCKERHUB_USER" || -z "$DOCKERHUB_TOKEN" ]] && return 0
+              if [[ "$ref" != */* ]]; then
+                  printf '%s\n%s\n' "$flag" "$DOCKERHUB_USER:$DOCKERHUB_TOKEN"
+                  return 0
+              fi
+              host="${ref%%/*}"
+              case "$host" in
+                  *.*|*:*|localhost)
+                      case "$host" in
+                          docker.io|index.docker.io|registry-1.docker.io)
+                              printf '%s\n%s\n' "$flag" "$DOCKERHUB_USER:$DOCKERHUB_TOKEN" ;;
+                      esac
+                      ;;
+                  *)
+                      # 无域名前缀 => Docker Hub (library/nginx、user/repo)
+                      printf '%s\n%s\n' "$flag" "$DOCKERHUB_USER:$DOCKERHUB_TOKEN" ;;
+              esac
+          }
           
           SYNC_SUMMARY=""
           SUCCESS_COUNT=0
@@ -250,7 +282,8 @@ jobs:
                   echo "目标镜像存在，比较镜像创建时间..."
                   
                   # 获取源镜像的创建时间 - 修复时间比较逻辑
-                  SRC_INFO=$(skopeo inspect docker://$image 2>/dev/null)
+                  mapfile -t HUB_ARGS < <(hub_creds --creds "$image")
+                  SRC_INFO=$(skopeo inspect "${HUB_ARGS[@]}" "docker://$image" 2>/dev/null)
                   if [ $? -eq 0 ]; then
                     SRC_CREATED_RAW=$(echo "$SRC_INFO" | jq -r '.Created // empty' 2>/dev/null)
                     # 尝试多种可能的时间字段
@@ -323,7 +356,8 @@ jobs:
                       fi
                   else
                       # 无法获取创建时间，检查镜像大小作为辅助判断
-                      SRC_SIZE=$(skopeo inspect docker://$image --format '{{.Size}}' 2>/dev/null || echo "0")
+                      mapfile -t HUB_ARGS < <(hub_creds --creds "$image")
+                      SRC_SIZE=$(skopeo inspect "${HUB_ARGS[@]}" "docker://$image" --format '{{.Size}}' 2>/dev/null || echo "0")
                       TARGET_SIZE=$(skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" --format '{{.Size}}' 2>/dev/null || echo "0")
                       
                       if [ "$SRC_SIZE" != "0" ] && [ "$TARGET_SIZE" != "0" ] && [ "$SRC_SIZE" = "$TARGET_SIZE" ]; then
@@ -341,7 +375,8 @@ jobs:
           }
           
           export -f check_image_status
-          export ALIYUN_REGISTRY_USER ALIYUN_REGISTRY_PASSWORD
+          export -f hub_creds
+          export ALIYUN_REGISTRY_USER ALIYUN_REGISTRY_PASSWORD DOCKERHUB_USER DOCKERHUB_TOKEN
           
           # 设置文件描述符用于收集结果
           exec 3<> >(while read result; do
@@ -405,10 +440,11 @@ jobs:
                   fi
 
                   echo "步骤 1/1: skopeo 直传 (不落 Docker 存储)..."
+                  mapfile -t HUB_ARGS < <(hub_creds --src-creds "$image")
                   if timeout 900 skopeo --tmpdir "$TMPBASE" copy \
                        --retry-times 3 \
                        --override-os linux --override-arch "$ARCH" \
-                       "${SRC_CREDS[@]}" \
+                       "${HUB_ARGS[@]}" \
                        --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" \
                        "docker://$image" "docker://$new_image"; then
                       echo "  ✅ 同步成功"
