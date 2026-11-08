@@ -594,6 +594,9 @@ jobs:
                   | LC_ALL=C grep -E '^(✨|🚨)' \
                   | sed 's/^/- /' || true)
           fi
+          # 打印过滤后的明细，便于在 Action 日志中核对推送内容（不打印 SendKey / URL）
+          echo "📋 通知明细（仅新增 / 失败）:"
+          printf '%s\n' "${SYNC_LIST:-（本次无新增或失败项）}"
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           SC_DESP=$(cat <<EOF
           ## $TITLE
