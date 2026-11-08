@@ -16,7 +16,7 @@
 | zstd 自适应 | ACR 个人版不接受 zstd 层，按源清单 `layers[].mediaType` 自动识别并强制转 gzip，不硬编码镜像名 |
 | 凭据隔离 | Docker Hub PAT 只发给 Docker Hub，`ghcr.io` 等第三方源保持匿名 |
 | 固定环境 | `runs-on: ubuntu-24.04` + `actions/checkout@v7`，规避系统镜像漂移与 Node 20 弃用警告 |
-| 通知 | 可选飞书 / 企微 Webhook，含新增 / 失败镜像清单与日志跳转链接 |
+| 通知 | Server酱 微信推送，每次运行发送 Markdown 摘要（含统计与日志链接），Turbo / ³ 自动适配 |
 
 ## 🚀 快速开始
 
@@ -32,11 +32,11 @@
 | `ALIYUN_REGISTRY_PASSWORD` | ✅ | ACR 访问令牌（临时密码，非账号登录密码） |
 | `DOCKERHUB_USER` | 可选 | Docker Hub 用户名 |
 | `DOCKERHUB_TOKEN` | 可选 | Docker Hub **Personal Access Token**，建议 `Repo Read-only` + 设置到期日 |
-| `WEBHOOK_URL` | 可选 | 飞书 / 企微机器人 Webhook 地址 |
+| `SERVERCHAN_SENDKEY` | 可选 | Server酱 SendKey（`SCT` 或 `sctp` 开头均可），用于微信通知 |
 
 不配 Docker Hub 凭据也能运行，但匿名拉取容易撞 Docker Hub 限流。两条 PAT 建议成对配置；工作流会按 registry 白名单分发凭据，**不会**把它发给 `ghcr.io` 等第三方源。
 
-> ⚠️ PAT 只写进 Secrets，不要写进 `images.txt`、`docker.yaml` 或提交记录；GitHub 会在日志中自动打码。
+> ⚠️ PAT 与 SendKey 只写进 Secrets，不要写进 `images.txt`、`docker.yaml` 或提交记录；GitHub 会在日志中自动打码。
 
 ### 2. 编辑镜像列表
 
@@ -122,19 +122,33 @@ ACR 个人版上传 zstd 层会返回 `unknown: blob type invalid`。上游 `diy
 
 > 系统 apt 版 skopeo 1.13.3 的 `--dest-compress-format` 不会重压已压缩层，`--dest-force-compress-format` 要到 1.21+ 才提供，所以这一步必须用新版。若 `quay.io` 不可达会打印警告并退回原路径，仅影响 zstd 镜像。
 
-## 🔔 通知预览
+## 🔔 微信通知（Server酱）
 
-配置 `WEBHOOK_URL` 后，任务结束（`if: always()`）发送精简文本卡片，按结果切换标题，并附新增 / 失败镜像清单与 GitHub 日志链接：
+在 [sct.ftqq.com](https://sct.ftqq.com) 微信扫码获取 SendKey、绑定推送通道后，把值填进 Secret **`SERVERCHAN_SENDKEY`**。工作流在任务结束时（`if: always()`）发一条消息，**每次运行都推**，包括「全部已是最新」：
 
-> ## **Docker镜像同步：成功**
+| 运行情况 | 消息标题 |
+| --- | --- |
+| job 异常终止 | 🚨 同步任务异常终止 |
+| 有镜像同步失败 | ❌ 阿里云镜像同步失败 |
+| 有新增同步 | ✅ 阿里云镜像同步成功 |
+| 全部跳过 | ⏭️ 同步完成，镜像已是最新 |
+
+正文是 Markdown（Server酱 的 `desp` 字段），包含新增 / 失败镜像清单、成功 / 跳过 / 失败统计、时间戳和**可点击的 GitHub 日志链接**：
+
+> ## ⏭️ 同步完成，镜像已是最新
 >
-> ✅ 本次新增同步镜像：2 个
-> ✨ moviepilot-v3
-> ✨ litepan:beta
+> 基于创建时间比较，所有镜像已是最新版本，无需同步。
+>
+> ---
+>
+> 📊 **统计**：成功 0 ｜ 跳过 71 ｜ 失败 0
+> 🔗 [查看 GitHub Action 日志](https://github.com/exonerationem/aliyun_image_pusher/actions/runs/...)
 
-![通知预览](https://github.com/user-attachments/assets/36e35447-31a4-4e3e-85d4-ca9005d32424)
+**两种 SendKey 自动适配**：`SCT` 开头走 Server酱Turbo（`https://sctapi.ftqq.com/{key}.send`）；`sctp` 开头走 Server酱³（自动从 `sctp<uid>t…` 解析 uid，请求 `https://{uid}.push.ft07.com/send/{key}.send`）。不需要手动填地址或区分版本。
 
-未配置时打印 `⚠️ 未配置 Webhook URL，跳过通知`，不影响同步。
+> ⚠️ SendKey 会出现在请求 URL 里，不要打印到日志、不要写进代码或提交记录。工作流用 `--data-urlencode` 发送中文 / emoji / Markdown，以返回 JSON 的 `code == 0` 判定成功；失败重试 3 次后只发 `::warning::`，**不影响同步结果**。
+
+未配置 `SERVERCHAN_SENDKEY` 时打印「跳过微信通知」，其余流程不受影响。免费额度 5 条/天，每天 2 次定时 + 偶尔手动触发足够。
 
 ## ⚠️ 已知限制
 
@@ -142,7 +156,8 @@ ACR 个人版上传 zstd 层会返回 `unknown: blob type invalid`。上游 `diy
 - **只同步单架构**：默认 `linux/amd64`；需要 arm64 请在 `images.txt` 用 `--platform` 逐行指定（注意写在行首）。
 - **失败重试有上限**：3 次失败后跳过该镜像，等下一轮再试。
 - **额外网络依赖**：仅 zstd 镜像会拉 `quay.io/skopeo/stable:v1.22.3`。
-- **定时注释有误**：`docker.yaml` 里那行注释写的是「UTC 00:00 / 北京 08:00」，实际 cron 为 `0 10,22 * * *`，即 UTC 10:00 / 22:00（北京 18:00 / 06:00）。以本 README 为准。
+- **通知额度**：Server酱 免费版 5 条/天，每次运行都推，每天 2 次定时约占 2 条；未配置 `SERVERCHAN_SENDKEY` 时静默跳过。
+- **通知失败不影响结论**：推送失败只发 `::warning::`，判断同步结果请看日志汇总行或 Actions 结论。
 
 ## 📅 更新日志
 
