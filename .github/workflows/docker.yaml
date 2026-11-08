@@ -150,6 +150,42 @@ jobs:
               esac
           }
           
+          # 阿里云 ACR 个人版不接受 zstd 压缩层（上传时返回 blob type invalid）。
+          # 老 workflow 走 docker pull/tag/push 时由 Docker daemon 顺带重压成 gzip；
+          # 改成 skopeo 仓库直传后 zstd 层被原样上传，rsshub 两个镜像因此失败。
+          # 这里按层 mediaType 自动识别，只对 zstd 源启用新版 skopeo 强制转 gzip，
+          # 不硬编码镜像名：上游改回 gzip 或将来新增 zstd 镜像都能自适应。
+          SKOPEO_NEW_IMAGE="quay.io/skopeo/stable:v1.22.3"
+          SKOPEO_NEW_READY=0
+
+          ensure_new_skopeo() {
+              [ "$SKOPEO_NEW_READY" -eq 1 ] && return 0
+              if docker pull -q "$SKOPEO_NEW_IMAGE" > /dev/null 2>&1; then
+                  SKOPEO_NEW_READY=1
+                  echo "  ✅ 新版 skopeo 已就绪: $SKOPEO_NEW_IMAGE"
+                  return 0
+              fi
+              echo "  ❌ 无法拉取 $SKOPEO_NEW_IMAGE"
+              return 1
+          }
+
+          # 判定 copy 将要选取的架构的源镜像是否含 zstd 层
+          # 用法: src_layers_need_convert "$image" "$ARCH" "${HUB_INSPECT_ARGS[@]}"
+          src_layers_need_convert() {
+              local image="$1" arch="$2"
+              shift 2
+              local raw sub repo
+              raw=$(skopeo inspect "$@" --raw "docker://$image" 2>/dev/null) || return 1
+              sub=$(echo "$raw" | jq -r --arg a "$arch" \
+                    '[.manifests[]? | select(.platform.os=="linux" and .platform.architecture==$a) | .digest][0] // empty')
+              if [ -n "$sub" ]; then
+                  # 去掉末尾 tag，同时保留 registry 可能带的端口
+                  repo=$(echo "$image" | sed -E 's/:[^:/]+$//')
+                  raw=$(skopeo inspect "$@" --raw "docker://${repo}@${sub}" 2>/dev/null) || return 1
+              fi
+              echo "$raw" | jq -e '[.layers[]?.mediaType | select(. and contains("zstd"))] | length > 0' > /dev/null 2>&1
+          }
+
           SYNC_SUMMARY=""
           SUCCESS_COUNT=0
           FAILURE_COUNT=0
@@ -441,9 +477,30 @@ jobs:
 
                   echo "步骤 1/1: skopeo 直传 (不落 Docker 存储)..."
                   mapfile -t HUB_ARGS < <(hub_creds --src-creds "$image")
-                  if timeout 900 skopeo --tmpdir "$TMPBASE" copy \
-                       --retry-times 3 \
-                       --override-os linux --override-arch "$ARCH" \
+                  mapfile -t HUB_INSPECT_ARGS < <(hub_creds --creds "$image")
+
+                  # 仅对 zstd 源启用强制转 gzip；其余镜像保持原路径不变
+                  COPY_CMD=(skopeo --tmpdir "$TMPBASE" copy --retry-times 3
+                            --override-os linux --override-arch "$ARCH")
+                  if src_layers_need_convert "$image" "$ARCH" "${HUB_INSPECT_ARGS[@]}"; then
+                      echo "  🔧 源含 zstd 层，ACR 不接受，启用新版 skopeo 强制转 gzip"
+                      if ensure_new_skopeo; then
+                          # 1.13.3 的 --dest-compress-format 不会重压已压缩层，
+                          # 必须用 1.21+ 的 --dest-force-compress-format。
+                          # 目标转成 Docker schema2，与 ACR 上现有正式 tag 格式一致，
+                          # 客户端兼容性最保守；实测保持源 OCI manifest 也可行。
+                          COPY_CMD=(docker run --rm "$SKOPEO_NEW_IMAGE" copy
+                                    --retry-times 3
+                                    --override-os linux --override-arch "$ARCH"
+                                    --dest-force-compress-format
+                                    --dest-compress-format gzip
+                                    --format v2s2)
+                      else
+                          echo "  ⚠️ 新版 skopeo 不可用，退回原路径（该镜像预计仍会失败）"
+                      fi
+                  fi
+
+                  if timeout 900 "${COPY_CMD[@]}" \
                        "${HUB_ARGS[@]}" \
                        --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" \
                        "docker://$image" "docker://$new_image"; then
