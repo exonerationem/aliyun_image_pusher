@@ -10,12 +10,19 @@ on:
     paths:
       - 'images.txt'
 
+concurrency:
+  group: aliyun-image-sync
+  cancel-in-progress: false
+
 env:
   ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
   ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
   WEBHOOK_URL: "${{ secrets.WEBHOOK_URL }}" # 在 Secrets 中配置飞书或企微地址
+  # 可选：Docker Hub 凭据，避免匿名拉取被限流
+  DOCKERHUB_USER: "${{ secrets.DOCKERHUB_USER }}"
+  DOCKERHUB_TOKEN: "${{ secrets.DOCKERHUB_TOKEN }}"
 
 jobs:
   build:
@@ -45,7 +52,8 @@ jobs:
           echo "✅ 当前运行于 GitHub 托管的运行器 (${{ runner.os }})。"
           echo "当前工作目录：$(pwd)"
           echo "可用磁盘空间："
-          df -h
+          df -h /
+          df -i /
       
       # 2. 检出代码
       - name: Checkout Code
@@ -55,28 +63,39 @@ jobs:
       - name: Install required tools
         run: |
           echo "=== 安装必需工具 ==="
-          sudo apt-get update
-          sudo apt-get install -y skopeo jq
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends skopeo jq
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
           echo "✅ skopeo 版本: $(skopeo --version)"
           echo "✅ jq 版本: $(jq --version)"
       
-      # 4. 最大化构建空间
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 2048
-          swap-size-mb: 128
-          remove-dotnet: 'true'
-          remove-haskell: 'true'
-          build-mount-path: '/var/lib/docker/'
-      
-      # 5. 重启 Docker
-      - name: Restart docker
+      # 4. 释放根盘空间（只删预装工具链，不重分区）
+      #    原 maximize-build-space 会把 / 压到 root-reserve-mb=2048，
+      #    而 runner 的 _diag、$RUNNER_TEMP、$GITHUB_WORKSPACE 都在 / 上，
+      #    等于把 runner 自己憋死，报错正是写 _diag 日志失败。
+      - name: Free disk space
         run: |
-          echo "=== 重启 Docker 服务 ==="
-          sudo service docker restart
-          sleep 5
-          docker info
+          echo "=== 清理前 ==="
+          df -h /
+          df -i /
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /usr/local/.ghcup \
+                      /usr/local/share/boost \
+                      /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force 2>/dev/null || true
+          echo "=== 清理后 ==="
+          df -h /
+      
+      # 5. 进入同步前记录磁盘水位
+      - name: Disk preflight
+        run: |
+          echo "=== 磁盘预检 ==="
+          df -h /
+          df -i /
+          docker system df || true
       
       # 6. 并行检查镜像状态，然后串行同步需要更新的镜像
       - name: Parallel Check and Sequential Sync
@@ -84,8 +103,20 @@ jobs:
         run: |
           echo "=== 开始同步镜像到阿里云 ==="
           
-          # 登录阿里云容器镜像服务
-          echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
+          # skopeo 仓库到仓库直传，用 --dest-creds 认证，无需 docker login / Docker daemon
+          TMPBASE="$RUNNER_TEMP/skopeo-tmp"
+          if [ -d /mnt ] && [ "$(stat -c %d /mnt 2>/dev/null)" != "$(stat -c %d /)" ]; then
+              TMPBASE=/mnt/skopeo-tmp
+          fi
+          mkdir -p "$TMPBASE"
+          export TMPDIR="$TMPBASE"
+          echo "skopeo 临时目录: $TMPBASE"
+          df -h /
+
+          SRC_CREDS=()
+          if [[ -n "$DOCKERHUB_USER" && -n "$DOCKERHUB_TOKEN" ]]; then
+              SRC_CREDS=(--src-creds "$DOCKERHUB_USER:$DOCKERHUB_TOKEN")
+          fi
           
           SYNC_SUMMARY=""
           SUCCESS_COUNT=0
@@ -211,12 +242,7 @@ jobs:
               local platform=$(echo "$line_data" | cut -d'|' -f6)
               local duplicate_info=$(echo "$line_data" | cut -d'|' -f7)
               
-              echo "--- 检查第 $line_number 行 ---"
-              echo "原始镜像: $image"
-              echo "目标镜像: $new_image"
-              echo "平台架构: $platform"
-              echo "命名空间: $name_space"
-              echo "重名处理: $duplicate_info"
+              echo "--- 检查第 $line_number 行: $image -> $new_image ($platform) ---"
               
               # 检查目标镜像是否存在
               if skopeo inspect docker://$new_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
@@ -364,47 +390,39 @@ jobs:
                   echo "原始镜像: $image"
                   echo "目标镜像: $new_image"
                   
-                  echo "开始同步镜像..."
-                  
-                  # 执行同步（带超时和详细日志）
-                  # 1. 拉取镜像
-                  echo "步骤 1/3: 拉取源镜像..."
-                  if timeout 300 docker pull "$image"; then
-                      echo "  ✅ 拉取成功"
-                      
-                      # 2. 重新标记镜像
-                      echo "步骤 2/3: 重新标记镜像..."
-                      if docker tag "$image" "$new_image"; then
-                          echo "  ✅ 重标记成功"
-                          
-                          # 3. 推送到阿里云
-                          echo "步骤 3/3: 推送到阿里云..."
-                          if timeout 600 docker push "$new_image"; then
-                              echo "  ✅ 推送成功"
-                              
-                              # 清理本地镜像
-                              docker rmi "$image" "$new_image" 2>/dev/null || true
-                              docker system prune -f 2>/dev/null || true
-                              
-                              SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $image_name_tag"
-                              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-                              echo "✅ 同步完成: $image_name_tag"
-                          else
-                              echo "  ❌ 推送失败"
-                              SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (推送失败)"
-                              FAILURE_COUNT=$((FAILURE_COUNT + 1))
-                          fi
-                      else
-                          echo "  ❌ 重标记失败"
-                          SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (重命名失败)"
-                          FAILURE_COUNT=$((FAILURE_COUNT + 1))
-                      fi
+                  ARCH="amd64"
+                  SRC_PLATFORM=$(echo "$line" | cut -d'|' -f7)
+                  if [[ "$SRC_PLATFORM" == */* ]]; then
+                      ARCH="${SRC_PLATFORM##*/}"
+                  fi
+
+                  rm -rf "$TMPBASE"/*
+                  USED=$(df -P / | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
+                  echo "根盘使用率: ${USED}% | skopeo 临时目录: $TMPBASE"
+                  if [ "$USED" -ge 90 ]; then
+                      echo "::error::根盘使用率 ${USED}%，提前中止，避免 runner 写日志失败导致整个 job 崩溃"
+                      exit 1
+                  fi
+
+                  echo "步骤 1/1: skopeo 直传 (不落 Docker 存储)..."
+                  if timeout 900 skopeo --tmpdir "$TMPBASE" copy \
+                       --retry-times 3 \
+                       --override-os linux --override-arch "$ARCH" \
+                       "${SRC_CREDS[@]}" \
+                       --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" \
+                       "docker://$image" "docker://$new_image"; then
+                      echo "  ✅ 同步成功"
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ $image_name_tag"
+                      SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+                      echo "✅ 同步完成: $image_name_tag"
                   else
-                      echo "  ❌ 拉取失败"
-                      SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (拉取失败)"
+                      echo "  ❌ 同步失败"
+                      SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (同步失败)"
                       FAILURE_COUNT=$((FAILURE_COUNT + 1))
                   fi
-                  
+
+                  # 无论成功失败都清掉本轮临时 blob
+                  rm -rf "$TMPBASE"/*
                   echo ""
               fi
           done < "$NEED_SYNC_FILE"
@@ -414,6 +432,7 @@ jobs:
           
           # 清理临时文件
           rm -f "$TEMP_FILE" "$NEED_SYNC_FILE" "$SKIPPED_FILE"
+          rm -rf "$TMPBASE"
           
           # 写入环境变量
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
@@ -428,16 +447,16 @@ jobs:
             fi
             echo 'EOF'
           } >> $GITHUB_ENV      
-      # 7. 清理 Docker 系统
-      - name: Clean up Docker system
+      # 7. 收尾清理与磁盘报告
+      - name: Clean up and disk report
         if: always()
         run: |
-          echo "=== 清理 Docker 系统 ==="
+          echo "=== 收尾清理 ==="
+          rm -rf "$RUNNER_TEMP/skopeo-tmp" /mnt/skopeo-tmp 2>/dev/null || true
           docker system prune -af 2>/dev/null || true
-          docker builder prune -af 2>/dev/null || true
-          echo "✅ 清理完成"
           echo "剩余磁盘空间:"
-          df -h
+          df -h /
+          df -i /
       
       # 8. 发送 Webhook 通知
       - name: 发送 Webhook 通知
@@ -448,9 +467,9 @@ jobs:
             exit 0
           fi
           
-          S_COUNT=${{ env.SUCCESS_COUNT }}
-          F_COUNT=${{ env.FAILURE_COUNT }}
-          K_COUNT=${{ env.SKIP_COUNT }}
+          S_COUNT=${{ env.SUCCESS_COUNT || 0 }}
+          F_COUNT=${{ env.FAILURE_COUNT || 0 }}
+          K_COUNT=${{ env.SKIP_COUNT || 0 }}
           
           # 1. 判定标题和主状态
           if [ "$F_COUNT" -gt 0 ]; then
