@@ -3,7 +3,7 @@ name: Docker Image Sync to Aliyun
 on:
   workflow_dispatch:
   schedule:
-    # 每天 UTC 时间 00:00 (即北京时间 08:00) 运行
+    # 每天 UTC 10:00 / 22:00 (即北京时间 18:00 / 06:00) 运行
     - cron: '0 10,22 * * *'
   push:
     branches: [ main ]
@@ -19,7 +19,6 @@ env:
   ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
-  WEBHOOK_URL: "${{ secrets.WEBHOOK_URL }}" # 在 Secrets 中配置飞书或企微地址
   # 可选：Docker Hub 凭据，避免匿名拉取被限流
   DOCKERHUB_USER: "${{ secrets.DOCKERHUB_USER }}"
   DOCKERHUB_TOKEN: "${{ secrets.DOCKERHUB_TOKEN }}"
@@ -551,61 +550,99 @@ jobs:
           df -h /
           df -i /
       
-      # 8. 发送 Webhook 通知
-      - name: 发送 Webhook 通知
+      # 8. 发送 Server酱 微信通知（每次运行都推，包括「无更新」）
+      - name: 发送 Server酱 通知
         if: always()
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          JOB_STATUS: ${{ job.status }}
         run: |
-          if [ -z "${{ secrets.WEBHOOK_URL }}" ]; then
-            echo "⚠️ 未配置 Webhook URL，跳过通知"
-            exit 0
+          if [ -z "$SERVERCHAN_SENDKEY" ]; then
+              echo "⚠️ 未配置 SERVERCHAN_SENDKEY，跳过微信通知"
+              exit 0
           fi
-          
-          S_COUNT=${{ env.SUCCESS_COUNT || 0 }}
-          F_COUNT=${{ env.FAILURE_COUNT || 0 }}
-          K_COUNT=${{ env.SKIP_COUNT || 0 }}
-          
-          # 1. 判定标题和主状态
-          if [ "$F_COUNT" -gt 0 ]; then
+
+          S_COUNT="${SUCCESS_COUNT:-0}"
+          F_COUNT="${FAILURE_COUNT:-0}"
+          K_COUNT="${SKIP_COUNT:-0}"
+
+          # 1. 判定标题与主状态
+          if [ "$JOB_STATUS" != "success" ]; then
+              TITLE="🚨 同步任务异常终止"
+              CONTENT="工作流状态：$JOB_STATUS，请查看运行日志。"
+          elif [ "$F_COUNT" -gt 0 ]; then
               TITLE="❌ 阿里云镜像同步失败"
-              CONTENT="⚠️ 警告：有 $F_COUNT 个镜像同步出现异常，请及时检查。"
+              CONTENT="⚠️ 有 $F_COUNT 个镜像同步异常，请及时检查。"
           elif [ "$S_COUNT" -gt 0 ]; then
               TITLE="✅ 阿里云镜像同步成功"
               CONTENT="本次新增同步镜像如下："
           elif [ "$K_COUNT" -gt 0 ]; then
-              TITLE="⏭️ 同步任务完成 (镜像已是最新)"
+              TITLE="⏭️ 同步完成，镜像已是最新"
               CONTENT="基于创建时间比较，所有镜像已是最新版本，无需同步。"
           else
-              TITLE="☕ 同步任务完成 (无镜像需要处理)"
+              TITLE="☕ 同步任务完成，无镜像需要处理"
               CONTENT="检测到 images.txt 中无有效镜像需要处理。"
           fi
-          
-          # 2. 组装最终文本
-          RAW_TEXT=$(cat <<EOF
-          $TITLE
-          ━━━━━━━━━━━━━━━━
+
+          # 2. 组装 Markdown 正文（Server酱 的 desp 支持 Markdown）
+          #    只推 ✨ 新增 / 🚨 失败，⏭️ 跳过项和「本次没有需要同步的新镜像」
+          #    等占位文案一律过滤；SYNC_RESULT 仍保留完整明细供日志使用
+          SYNC_LIST=""
+          if [ -n "${SYNC_RESULT:-}" ]; then
+              # LC_ALL=C 按字节匹配，避免 runner 多字节 locale 差异影响 🚨(4 字节) 的命中
+              SYNC_LIST=$(printf '%s\n' "$SYNC_RESULT" \
+                  | LC_ALL=C grep -E '^(✨|🚨)' \
+                  | sed 's/^/- /' || true)
+          fi
+          # 打印过滤后的明细，便于在 Action 日志中核对推送内容（不打印 SendKey / URL）
+          echo "📋 通知明细（仅新增 / 失败）:"
+          printf '%s\n' "${SYNC_LIST:-（本次无新增或失败项）}"
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          SC_DESP=$(cat <<EOF
+          ## $TITLE
+
           $CONTENT
-          ${{ env.SYNC_RESULT }}
-          
-          📊 统计: 成功 $S_COUNT | 跳过 $K_COUNT | 失败 $F_COUNT
-          📅 时间: $(date '+%Y-%m-%d %H:%M:%S')
-          🔗 详情: [查看 GitHub Action 日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          $SYNC_LIST
+
+          ---
+
+          📊 **统计**：成功 $S_COUNT ｜ 跳过 $K_COUNT ｜ 失败 $F_COUNT
+          📅 **时间**：$(date '+%Y-%m-%d %H:%M:%S')
+          🔗 [查看 GitHub Action 日志]($RUN_URL)
           EOF
           )
-          
-          # 3. 发送通知
-          echo "发送 Webhook 通知..."
-          JSON_PAYLOAD=$(jq -n --arg msg "$RAW_TEXT" '{"msg_type":"text","content":{"text":$msg}}')
-          
-          # 尝试发送，最多重试3次
-          for i in {1..3}; do
-              if curl -s -X POST -H "Content-Type: application/json" \
-                 -d "$JSON_PAYLOAD" \
-                 -w "HTTP Status: %{http_code}" \
-                 "${{ secrets.WEBHOOK_URL }}" > /dev/null 2>&1; then
-                  echo "✅ 通知发送成功 (尝试 $i 次)"
-                  break
-              else
-                  echo "⚠️ 通知发送失败，第 $i 次尝试"
-                  sleep 2
+
+          # 3. 按 SendKey 前缀自动选择 Server酱Turbo / Server酱³ 接口
+          case "$SERVERCHAN_SENDKEY" in
+              sctp*)
+                  SC_UID=$(echo "$SERVERCHAN_SENDKEY" | sed -E 's/^sctp([0-9]+)t.*/\1/')
+                  if ! [[ "$SC_UID" =~ ^[0-9]+$ ]]; then
+                      echo "::warning::sctp SendKey 格式异常，无法解析 uid，跳过通知"
+                      exit 0
+                  fi
+                  SC_URL="https://${SC_UID}.push.ft07.com/send/${SERVERCHAN_SENDKEY}.send"
+                  ;;
+              *)
+                  SC_URL="https://sctapi.ftqq.com/${SERVERCHAN_SENDKEY}.send"
+                  ;;
+          esac
+
+          # title 不能含换行；标题是固定短文案，不做字节截断以免切坏中文
+          SC_TITLE=$(printf '%s' "$TITLE" | tr '\n' ' ')
+
+          # 4. 发送：成功以返回 JSON 的 code==0 为准，最多重试 3 次
+          #    不要打印 SC_URL 或响应原文（SendKey 在 URL 中）
+          for i in 1 2 3; do
+              RESP=$(curl -s --max-time 15 -X POST \
+                  --data-urlencode "title=$SC_TITLE" \
+                  --data-urlencode "desp=$SC_DESP" \
+                  "$SC_URL" 2>/dev/null) || RESP=""
+              if echo "$RESP" | jq -e '.code == 0' >/dev/null 2>&1; then
+                  echo "✅ Server酱 通知发送成功 (第 $i 次)"
+                  exit 0
               fi
+              echo "⚠️ Server酱 通知发送失败 (第 $i 次)，2 秒后重试"
+              sleep 2
           done
+          echo "::warning::Server酱 通知发送失败（已重试 3 次），不影响同步结果"

@@ -1,6 +1,39 @@
 # 更新日志 (Changelog)
 
-## [v2.0.0] - 2026-11-08 (当前版本)
+## [v2.1.0] - 2026-11-08 (当前版本)
+
+> 通知通道改为 **Server酱 微信推送**，移除从未配置过的飞书 / 企微 Webhook。同步逻辑一行未动。
+
+### 🚀 新增 (Added)
+- **Server酱 通知**：任务结束（`if: always()`）发送一条 Markdown 消息，**每次运行都推**，标题按 job 异常 / 有失败 / 有新增 / 全跳过四种情况动态切换；正文含新增与失败镜像清单、统计、时间戳和可点击的 GitHub 日志链接。
+- **Turbo / Server酱³ 自动适配**：按 `SERVERCHAN_SENDKEY` 前缀选择 `https://sctapi.ftqq.com/{key}.send` 或 `https://{uid}.push.ft07.com/send/{key}.send`，uid 从 `sctp<uid>t…` 解析并做数字校验。
+- **通知成功判定**：以返回 JSON 的 `code == 0` 为准。旧飞书逻辑只看 curl 退出码，HTTP 200 但业务失败会被误判为「发送成功」；现在失败重试 3 次后只发 `::warning::`，不影响 job 结论。
+- **job 异常告警**：新增 `JOB_STATUS` 判断，工作流非 `success` 时推送「🚨 同步任务异常终止」，补齐同步步骤崩溃时的告警盲区。
+
+### 🔧 变更 (Changed)
+- **移除飞书 / 企微渠道**：删除 job 级 `WEBHOOK_URL` 与 `msg_type: text` payload 构造代码。该 Secret 从未配置，无实际影响。
+- **凭据最小暴露**：`SERVERCHAN_SENDKEY` 只放在通知 step 级 `env`，不在 job 级 env 或 shell 脚本里做 `${{ }}` 插值；SendKey 不打印、curl 错误输出丢弃。
+- **正文改 Markdown**：用 `--data-urlencode` 发送 `title` / `desp`，正确处理中文、emoji、换行与链接；`SYNC_RESULT` 转成列表项。不再按字节截断标题（避免切坏中文）。
+- 计数变量改用 shell 环境变量加 `${X:-0}` 兜底，去掉 `${{ env.X }}` 插值，减少脚本源码回显与注入面。
+
+### 🐛 修复 (Fixed)
+- 修正 `docker.yaml` 的 cron 注释：实际为 UTC 10:00 / 22:00（北京 18:00 / 06:00），旧注释误写 UTC 00:00 / 北京 08:00。
+
+### 📝 文档 (Docs)
+- README：Secrets 表用 `SERVERCHAN_SENDKEY` 替换 `WEBHOOK_URL`；通知章节改写为 Server酱（两种 SendKey、Markdown 正文、5 条/天额度）；移除已修正的「定时注释有误」已知限制。
+
+### ✅ 验证记录
+- 本地以 curl / jq stub 模拟 6 种场景全部通过：Turbo 与 ³ 地址生成、中文标题完整、日志链接存在、`code == 0` 成功、业务失败重试 3 次、未配置 / 格式异常时安全跳过、job 失败标题。
+- YAML 解析通过（8 个 step），全部 `run` 块 `bash -n` 通过。
+
+### ⚠️ 已知限制
+- Server酱 免费版 5 条/天；每天 2 次定时约占 2 条额度。
+- 未配置 `SERVERCHAN_SENDKEY` 时静默跳过微信通知，不影响同步。
+- 「假绿」仍在：单个镜像失败不 `exit 1`，判断真实结果请看日志汇总行。
+
+---
+
+## [v2.0.0] - 2026-11-08
 
 > **同步引擎重构 + 稳定性修复。** 本版把镜像传输从 `docker pull/tag/push` 换成 `skopeo` 仓库直传，并修复了一个会让整个 job 崩溃的磁盘问题；同时补齐 zstd 层兼容、凭据隔离与 runner 环境固定。行为上有两处变化见「变更」。
 
@@ -49,7 +82,7 @@
 ### ⚠️ 已知限制
 
 - **「假绿」**：单个镜像失败只累加计数、不 `exit 1`，job 结论仍可能是 `success`；需看日志末尾的 `成功/跳过/失败` 汇总行。
-- `WEBHOOK_URL` 未配置时通知步骤会跳过，不影响同步。
+- `WEBHOOK_URL` 未配置时通知步骤会跳过，不影响同步。（该通道已在 v2.1.0 移除，改为 Server酱）
 - zstd 镜像额外依赖 `quay.io`；不可达时退回原路径，仅这类镜像会失败。
 - 创建时间判据在上游「同 tag 重推但固定 `Created`」时会漏同步。
 
