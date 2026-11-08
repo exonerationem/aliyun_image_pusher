@@ -63,7 +63,7 @@ jobs:
 
       - name: 读取源镜像层格式（确认是 zstd）
         run: |
-          sk() { docker run --rm "$SKOPEO_IMAGE" "$@"; }
+          sk() { timeout 900 docker run --rm "$SKOPEO_IMAGE" "$@"; }
           SRC_CREDS=(--creds "$DOCKERHUB_USER:$DOCKERHUB_TOKEN")
           RAW=$(sk inspect "${SRC_CREDS[@]}" --raw "docker://$SRC_IMAGE")
           # 顶层可能是 OCI index / manifest list，需取 linux/amd64 子清单
@@ -85,7 +85,7 @@ jobs:
 
       - name: 转换推送到测试 tag 并读回校验
         run: |
-          sk() { docker run --rm "$SKOPEO_IMAGE" "$@"; }
+          sk() { timeout 900 docker run --rm "$SKOPEO_IMAGE" "$@"; }
           SRC_ARGS=(--src-creds "$DOCKERHUB_USER:$DOCKERHUB_TOKEN")
           DST_ARGS=(--dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD")
           INSPECT_ARGS=(--creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD")
@@ -103,7 +103,7 @@ jobs:
             echo "=========================================================="
             echo "=== 变体 $variant -> $TARGET_BASE:$TAG ==="
             echo "=========================================================="
-            if timeout 900 sk copy "${COMMON[@]}" "${EXTRA[@]}" \
+            if sk copy "${COMMON[@]}" "${EXTRA[@]}" \
                  "${SRC_ARGS[@]}" "${DST_ARGS[@]}" \
                  "docker://$SRC_IMAGE" "docker://$TARGET_BASE:$TAG"; then
               echo "✅ copy 完成"
