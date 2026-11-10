@@ -2,10 +2,12 @@ name: Docker Image Sync to Aliyun
 
 on:
   workflow_dispatch:
-  # 定时由 NAS 上的青龙面板调用 GitHub REST API (workflow_dispatch) 触发，
-  # 每天北京时间 06:17 / 18:17。此处刻意不再用 schedule：GitHub 会在派发
-  # 定时事件前排队 3~10 小时（实测 created_at == run_started_at 且远晚于 cron），
-  # 且残留的延迟事件会与面板触发叠加，一天推送 4 条微信通知。
+  schedule:
+    # 每周一次兜底：UTC 周三 03:17 = 北京周三 11:17。
+    # 主定时由 NAS 青龙面板调 REST API 触发（每天北京 06:17 / 18:17）；
+    # GitHub schedule 可能延迟数小时或被丢弃，只作为面板失效时的最低限度兜底，
+    # 频次压到每周一次，避免与面板触发叠加产生多余通知。
+    - cron: '17 3 * * 3'
   push:
     branches: [ main ]
     paths:
