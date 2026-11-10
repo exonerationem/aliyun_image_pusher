@@ -4,7 +4,7 @@
 
 把 Docker Hub、`ghcr.io` 等公共镜像**自动同步到阿里云容器镜像服务（ACR）**，解决国内拉取慢、拉取失败的问题。
 
-同步完全在 GitHub 托管 runner 上完成：用 `skopeo` 在源 registry 与目标 registry 之间**直传**，不经过 Docker daemon、不落 Docker 存储、不需要自己的服务器或 NAS。当前 `images.txt` 维护 71 个镜像，目标为 ACR **公开仓库**。
+同步完全在 GitHub 托管 runner 上完成：用 `skopeo` 在源 registry 与目标 registry 之间**直传**，不经过 Docker daemon、不落 Docker 存储，同步执行本身不需要自己的服务器或 NAS。当前 `images.txt` 维护 71 个镜像，目标为 ACR **公开仓库**。定时触发改由 NAS 上的青龙面板调用 GitHub REST API 完成（见[触发同步](#3-触发同步)）。
 
 ## ✨ 当前特性
 
@@ -68,15 +68,17 @@ ghcr.io/homarr-labs/homarr
 
 | 方式 | 触发条件 | 时间 |
 | --- | --- | --- |
-| 定时 | `schedule: '17 10,22 * * *'` | 每天 **UTC 10:17 / 22:17**（北京 **18:17 / 06:17**） |
+| **定时** | **NAS 青龙面板**调用 GitHub REST API 创建 `workflow_dispatch` run | 每天**北京时间 06:17 / 18:17**（面板容器为 CST，cron `17 6,18 * * *`） |
 | 自动 | push 到 `main` 且**只有 `images.txt` 变更** | 提交后立即 |
 | 手动 | `Actions → Docker Image Sync to Aliyun → Run workflow` | 随时 |
 
-⚠️ **修改 `.github/workflows/docker.yaml` 本身不会触发 CI**（`on.push.paths` 只含 `images.txt`）。改完工作流必须手动 `Run workflow` 验证，否则会出现「提交完没反应」。
+⚠️ **修改 `.github/workflows/docker.yaml` 本身不会触发 CI**（`on.push.paths` 只含 `images.txt`）。改动涉及工作流或通知时，需要手动 `Run workflow` 验证，否则会出现「提交完没反应」。
 
-**为什么是 `:17` 而不是整点**：GitHub 官方文档说明 `schedule` 按 UTC 执行，且「每小时的开头」属于高负载时段，此时定时事件可能被延迟，排队过久的作业甚至会被直接丢弃。2026-11-08 北京 18:00 那次就整点未触发（当天凌晨的定时也普遍漂移 3~7 小时），改为 UTC 10:17 / 22:17 避开拥堵。GitHub 不保证精确到分钟，实际开始时间仍可能略晚，属正常现象；同步逻辑幂等，晚跑不会重复推送镜像（只会让通知晚到）。
+**为什么不用 GitHub `schedule`**：实测三条定时运行的 `created_at` 与 `run_started_at` 完全相同、却比计划晚 3~10 小时（11/09 06:17 → 09:43、11/09 18:17 → 11/10 04:43、11/10 06:17 → 12:06），说明延迟发生在 GitHub **派发事件之前**，不是 runner 排队、不是 `concurrency` 阻塞，也不是脚本慢（每次 run 本身仅约 7 分钟、9 步全绿）。错峰到整点后 17 分（v2.1.1）并未改善。GitHub 官方文档也只承诺「高负载时可能延迟甚至丢弃」、不保证精确到分钟。因此改为**外部定时 + REST dispatch**：run 秒级创建，不再有随机漂移。
 
-同一时间只会跑一个同步任务（`concurrency: aliyun-image-sync`，`cancel-in-progress: false`）：定时任务运行中手动触发会**排队**，不会打断正在跑的任务。
+> 面板侧配置：环境变量 `GITHUB_PAT`（fine-grained PAT，仅本仓库 `Actions: Read and write`）、脚本 `github_dispatch.sh`、任务「GitHub 镜像同步触发」命令 `task github_dispatch.sh`。脚本按 **2xx 判定成功**（带 `X-GitHub-Api-Version: 2026-03-10` 返回 200 + `workflow_run_id`，不带时返回 204 无响应体），失败 `exit 1` 让面板标红。触发准点 ≠ 通知准点：同步约 7 分钟，微信约 **06:24 / 18:24** 到达。
+
+同一时间只会跑一个同步任务（`concurrency: aliyun-image-sync`，`cancel-in-progress: false`）：任务运行中手动触发会**排队**，不会打断正在跑的任务。
 
 ## 📝 命名转换规则
 
@@ -153,19 +155,21 @@ ACR 个人版上传 zstd 层会返回 `unknown: blob type invalid`。上游 `diy
 
 ## 🔍 每日失败巡检
 
-WorkBuddy 自动化任务「镜像同步失败巡检」每天 **北京时间 07:00** 运行一次，覆盖过去 30 小时内的两次定时运行（北京 18:17 / 06:17）；**成功时静默，不产生任何报告**：
+WorkBuddy 自动化任务「镜像同步失败巡检」每天 **北京时间 07:00** 运行一次，覆盖过去 30 小时内的两次面板定时运行（北京 18:17 / 06:17）；**成功时静默，不产生任何报告**：
 
 - 检查 Actions 结论（`failure` / `cancelled` / `timed_out` / `action_required`，以及卡住超过 1 小时的 `in_progress`）；
 - 即使结论是 `success`，也会读日志末尾 `成功: N, 跳过: N, 失败: N` 汇总行，失败数 > 0 同样报警，专门兜住下面的「假绿」；
+- **窗口内 `workflow_dispatch` / `schedule` 的 run 少于 2 条即报警**（排除 `push`），用于发现「青龙任务没跑 / PAT 过期 / 面板容器停了」这类不产生失败日志的情况；
 - 异常时报告 run id / URL、失败 job/step、失败镜像名、关键日志片段、根因与可执行修复建议。
 
 排查重点包含 ENOSPC、Docker Hub 限流 / 401、skopeo 认证、`ImageOS` / `ImageVersion` 漂移、ACR `blob type invalid`，以及 Server酱 通知步骤是否发送成功（通知失败只发 `::warning::`，不影响同步结论）。
 
-> 若 GitHub 把定时事件延迟到 07:00 之后，该 run 仍落在 30 小时窗口内，会在次日巡检被检出，不会永久漏报。
+> 局限：手动 `Run workflow` 与面板触发的 `event` 同为 `workflow_dispatch`，无法从 API 区分，所以手动补跑会掩盖一次定时丢失；但 PAT 失效、容器停机这类连续多窗口无 run 的情况仍会被检出。
 
 ## ⚠️ 已知限制
 
 - **「假绿」**：单个镜像失败只累加失败计数、不会 `exit 1`，job 结论仍可能是 `success`。判断真实结果请看日志末尾的 `成功: N, 跳过: N, 失败: N` 汇总行（每日巡检已自动做这项检查）。
+- **依赖外部调度**：定时由 NAS 青龙面板发起，仓库侧已移除 `schedule`，**没有 GitHub 兜底**。NAS 关机、青龙容器停止、任务被停用、面板网络不通，或 fine-grained PAT 到期（建议 90 天），都会让定时静默失效；每日巡检会在窗口内 run 数不足时报警。PAT 只存面板环境变量，不进仓库、不进日志。
 - **只同步单架构**：默认 `linux/amd64`；需要 arm64 请在 `images.txt` 用 `--platform` 逐行指定（注意写在行首）。
 - **失败重试有上限**：3 次失败后跳过该镜像，等下一轮再试。
 - **额外网络依赖**：仅 zstd 镜像会拉 `quay.io/skopeo/stable:v1.22.3`。
