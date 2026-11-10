@@ -1,6 +1,38 @@
 # 更新日志 (Changelog)
 
-## [v2.2.1] - 2026-11-10 (当前版本)
+## [v2.2.2] - 2026-11-10 (当前版本)
+
+> **每日失败巡检从 WorkBuddy 本机搬到 NAS 青龙面板**，不再依赖 PC 开机；同步、触发与通知逻辑一行未动。
+
+### ✨ 新增 (Added)
+- 青龙脚本 `github_patrol.sh`（与 `github_dispatch.sh` 并列）：每天北京时间 **07:00**（cron `0 7 * * *`，容器为 CST）检查过去 30 小时的 Actions run，判断三类异常：① 结论非 `success`，或 run 卡在 `in_progress` / `queued` 超过 1 小时；② **「假绿」**——结论 `success` 但日志汇总「成功: N, 跳过: N, 失败: N」中失败数 > 0；③ **定时丢失**——窗口内 `workflow_dispatch` / `schedule` 的 run 少于 2 条（排除 `push`）。
+- 异常时用 **Server酱** 推微信 Markdown 报告（北京时间、窗口统计、异常明细、关键错误、run 链接与修复建议），并 `exit 1` 让青龙任务标红；全部正常时**静默**。Turbo / ³ 自动适配，按返回 `code == 0` 判定、失败重试 3 次。
+- 巡检自身异常（缺 PAT、GitHub API 不可达、PAT 过期）同样告警，避免「巡检静默失效」。支持 `PATROL_DRY_RUN` / `PATROL_TEST` 演练，以及 `GITHUB_PROXY`、`PATROL_WINDOW_HOURS`、`PATROL_MIN_RUNS`、`PATROL_ALLOW_NO_LOG` 可调。
+
+### 🔧 变更 (Changed)
+- 青龙任务 **1373**「GitHub 镜像同步触发」（每天 06:17 / 18:17）保持不变；新增任务 **1375**「GitHub 镜像同步巡检」（`task github_patrol.sh`，每天 07:00）。
+- 青龙「环境变量」新增 `SERVERCHAN_SENDKEY`（与 GitHub Secret 同值，用于巡检告警）；`GITHUB_PAT` 与触发脚本共用。未配置 SendKey 时降级为「报告只写青龙日志 + 任务标红」。
+- WorkBuddy 本机 automation「镜像同步失败巡检」(`02371fae-…`) 置为 **PAUSED**（保留配置可随时恢复），避免与青龙重复巡检。
+- 巡检实现由「本机 `gh` CLI + 会话内读日志分析」改为「青龙容器内 Python3 + curl + GitHub REST API」的确定性脚本：日志走 `actions/jobs/{id}/logs` 的 302 纯文本，不解压 zip；PAT 通过 `curl -K` 配置文件传入，不出现在命令行参数与日志中。
+
+### 📝 文档 (Docs)
+- README 巡检章节改写为青龙面板执行，删除「由 WorkBuddy 客户端在本机执行、关机不运行」的说明；已知限制改为「巡检依赖 NAS/青龙在线与 PAT 有效期」。
+
+### ✅ 验证记录
+- 青龙容器能力实测：`python3` / `jq` / `curl` 齐全，时区 `CST +0800`；`api.github.com` 与 `productionresultssa12.blob.core.windows.net` 均直连 200，能读到 job 日志纯文本中的汇总行。
+- 正常路径实跑（北京 14:47:42）：窗口内 6 条 run 全部 `success`、日志汇总失败数均为 0 → `✅ 巡检通过`，**未推微信**（成功静默），耗时 28 秒。
+- 异常路径演练（`PATROL_MIN_RUNS=99` + `PATROL_DRY_RUN=1`）：正确报出「定时丢失」，报告含窗口统计、6 条 run 明细与修复建议，且未推送、未标红。
+- 修正一处误报：job 日志会回显 workflow 脚本源码，注释里也含 `blob type invalid` 等字样；关键错误扫描现只对「确实有失败」的 run 执行。
+- 校验：`bash -n`、Python `py_compile`、LF 换行、无明文凭据。
+
+### ⚠️ 已知限制
+- 巡检依赖 NAS / 青龙容器在线与 `GITHUB_PAT` 有效期；PAT 过期时巡检会告警（前提是 `SERVERCHAN_SENDKEY` 已配置）。
+- 青龙面板若全局开启「任务失败通知」，异常时会额外收到一条面板通知，可在通知设置里排除该任务或忽略。
+- 手动 `Run workflow` 与面板触发同为 `workflow_dispatch`，无法从 API 区分，手动补跑可能掩盖一次定时丢失。
+
+---
+
+## [v2.2.1] - 2026-11-10
 
 > **恢复 GitHub `schedule` 作每周一次兜底**，同时大幅简化 README。青龙面板仍是每天两次的主触发，两种定时**任选其一或同时开启均可**。
 
