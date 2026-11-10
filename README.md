@@ -156,7 +156,7 @@ ACR 个人版上传 zstd 层会返回 `unknown: blob type invalid`。上游 `diy
 - 窗口内 `workflow_dispatch` / `schedule` 的 run 少于 2 条时报警，覆盖「青龙没跑 / PAT 过期 / 容器停机」这类没有失败日志的情况；
 - 异常时用 Server酱 推微信报告（run 链接、汇总统计、失败镜像、关键日志片段与修复建议），青龙任务同时标红。
 
-巡检在 NAS 青龙容器内运行，**不依赖 PC 开机**，只要 NAS / 青龙在线即可。所需环境变量：`GITHUB_PAT`（与触发脚本共用）、`SERVERCHAN_SENDKEY`（告警推送，与 GitHub Secret 同值）；未配置 SendKey 时降级为「只写青龙日志 + 任务标红」。可用 `PATROL_DRY_RUN=1` / `PATROL_TEST=1` 演练，不产生真实告警。
+巡检在 NAS 青龙容器内运行，**不依赖 PC 开机**，只要 NAS / 青龙在线即可。环境变量只需 `GITHUB_PAT`（与触发脚本共用）；告警 SendKey 按 `SERVERCHAN_SENDKEY` → 青龙自带 `PUSH_KEY`（面板「通知设置」里的 Server酱 Turbo SendKey，本机已配置）→ `SCKEY` 顺序自动读取，**通常无需新建环境变量**；三者都为空时降级为「只写青龙日志 + 任务标红」。可用 `PATROL_DRY_RUN=1` / `PATROL_TEST=1` 演练，不产生真实告警。
 
 > ⚠️ 原 WorkBuddy 本机 automation「镜像同步失败巡检」已暂停（保留配置可随时恢复），避免与青龙重复巡检。
 

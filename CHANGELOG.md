@@ -11,7 +11,7 @@
 
 ### 🔧 变更 (Changed)
 - 青龙任务 **1373**「GitHub 镜像同步触发」（每天 06:17 / 18:17）保持不变；新增任务 **1375**「GitHub 镜像同步巡检」（`task github_patrol.sh`，每天 07:00）。
-- 青龙「环境变量」新增 `SERVERCHAN_SENDKEY`（与 GitHub Secret 同值，用于巡检告警）；`GITHUB_PAT` 与触发脚本共用。未配置 SendKey 时降级为「报告只写青龙日志 + 任务标红」。
+- **无需新建环境变量**：告警 SendKey 按 `SERVERCHAN_SENDKEY` → `PUSH_KEY`（青龙面板「通知设置」里已有的 Server酱 Turbo SendKey，来自 `/ql/data/config/config.sh`，任务执行时自动加载）→ `SCKEY` 顺序自动读取，日志会打印来源名但**不打印值**；`GITHUB_PAT` 与触发脚本共用。三者都为空时降级为「报告只写青龙日志 + 任务标红」。
 - WorkBuddy 本机 automation「镜像同步失败巡检」(`02371fae-…`) 置为 **PAUSED**（保留配置可随时恢复），避免与青龙重复巡检。
 - 巡检实现由「本机 `gh` CLI + 会话内读日志分析」改为「青龙容器内 Python3 + curl + GitHub REST API」的确定性脚本：日志走 `actions/jobs/{id}/logs` 的 302 纯文本，不解压 zip；PAT 通过 `curl -K` 配置文件传入，不出现在命令行参数与日志中。
 
@@ -23,10 +23,12 @@
 - 正常路径实跑（北京 14:47:42）：窗口内 6 条 run 全部 `success`、日志汇总失败数均为 0 → `✅ 巡检通过`，**未推微信**（成功静默），耗时 28 秒。
 - 异常路径演练（`PATROL_MIN_RUNS=99` + `PATROL_DRY_RUN=1`）：正确报出「定时丢失」，报告含窗口统计、6 条 run 明细与修复建议，且未推送、未标红。
 - 修正一处误报：job 日志会回显 workflow 脚本源码，注释里也含 `blob type invalid` 等字样；关键错误扫描现只对「确实有失败」的 run 执行。
-- 校验：`bash -n`、Python `py_compile`、LF 换行、无明文凭据。
+- **青龙 SendKey 探测**：用临时只读探针（跑完即删）确认任务运行时环境已有 `PUSH_KEY`（32 位、`SCT` 开头的 Turbo SendKey），来自 `/ql/data/config/config.sh`；没有读取或打印任何凭据值。据此给脚本加 `PUSH_KEY` / `SCKEY` 回退。
+- **Server酱 端到端演练成功**（北京 15:13:08，临时 `PATROL_TEST=1`）：日志 `ℹ️ SendKey 来源：PUSH_KEY`、`✅ Server酱 告警发送成功（第 1 次）`，微信收到「🧪 青龙巡检演练（可忽略）」，任务标绿；演练变量跑完即删。
+- 校验：`bash -n`、Python `py_compile`、LF 换行、青龙脚本回读与本地逐字节一致、无明文凭据。
 
 ### ⚠️ 已知限制
-- 巡检依赖 NAS / 青龙容器在线与 `GITHUB_PAT` 有效期；PAT 过期时巡检会告警（前提是 `SERVERCHAN_SENDKEY` 已配置）。
+- 巡检依赖 NAS / 青龙容器在线、`GITHUB_PAT` 有效期与 `PUSH_KEY`（或 `SERVERCHAN_SENDKEY`）可用；PAT 过期时巡检会告警。
 - 青龙面板若全局开启「任务失败通知」，异常时会额外收到一条面板通知，可在通知设置里排除该任务或忽略。
 - 手动 `Run workflow` 与面板触发同为 `workflow_dispatch`，无法从 API 区分，手动补跑可能掩盖一次定时丢失。
 
