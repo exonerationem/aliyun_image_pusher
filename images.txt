@@ -16,6 +16,7 @@ moelin/1panel
 deluan/navidrome
 6053537/portainer-ce
 0nlylty/dockercopilot
+libremk66/dockhamster
 hisatri/lrcapi
 a76yyyy/qiandao
 easychen/cookiecloud
