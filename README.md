@@ -111,7 +111,7 @@ $ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/<镜像名:tag>
    - 目标不存在 → 需要同步
    - **优先比较 `Created` 创建时间**：源比目标新 → 同步；相同或更旧 → 跳过
    - 时间解析失败时回退比较 digest，再回退比较镜像大小
-3. **串行同步**：`skopeo copy --override-os linux --override-arch <arch> --dest-creds …`，重试 3 次、单镜像超时 900 秒；每轮无论成败都清理临时 blob。
+3. **串行同步**：`skopeo copy --override-os linux --override-arch <arch> --dest-creds …`，重试 3 次、单镜像超时 **300 秒**；同步步骤 27 分钟、整次运行 **30 分钟封顶**，每轮无论成败都清理临时 blob。正常一轮约 5~10 分钟。
 
 **为什么用创建时间而不是 digest？** 同步只抽取 `linux/amd64` 子镜像，且 ACR 上经旧版 `docker pull/tag/push` 推送的 manifest 会被重写（OCI ↔ schema2、`zstd` ↔ `gzip` 都会改变层 digest），源与目标 digest 天然不相等，直接比较会导致每轮全量重推；`Created` 来自 config blob，跨 registry 保持不变。代价：上游若固定 `Created` 重推同一 tag 会漏同步，可手动强制重推或改用 `config.digest` 方案。
 
@@ -165,7 +165,7 @@ ACR 个人版上传 zstd 层会返回 `unknown: blob type invalid`。上游 `diy
 - **「假绿」**：单个镜像失败只累加失败计数、不会 `exit 1`，job 结论仍可能是 `success`。判断真实结果请看日志末尾的 `成功: N, 跳过: N, 失败: N` 汇总行（每日巡检已自动做这项检查）。
 - **定时兜底有限**：青龙面板依赖 NAS 在线与 PAT 有效期（建议 90 天）；GitHub `schedule` 每周仅一次且可能延迟或丢弃；每日巡检同样跑在青龙上，NAS 停机时触发与巡检会一起失效。三者都不适合作为准点保证。
 - **只同步单架构**：默认 `linux/amd64`；需要 arm64 请在 `images.txt` 用 `--platform` 逐行指定（注意写在行首）。
-- **失败重试有上限**：3 次失败后跳过该镜像，等下一轮再试。
+- **失败重试有上限**：3 次失败后跳过该镜像，等下一轮再试。跨境连接挂起时 `skopeo` 不会报错也不触发重试，由 300 秒外层超时兜底，通知里标 `⏱ 同步超时`；整次超过 30 分钟会因 job 超时判为失败，未同步的镜像下一轮自动重试。
 - **额外网络依赖**：仅 zstd 镜像会拉 `quay.io/skopeo/stable:v1.22.3`。
 - **通知额度**：Server酱 免费版 5 条/天（会员不限），每次运行都推；同时开启两种定时时，兜底那周会多一条。
 - **通知失败不影响结论**：推送失败只发 `::warning::`，判断同步结果请看日志汇总行或 Actions 结论。
