@@ -33,6 +33,9 @@ jobs:
     # 期间同一份 workflow 可能落到 24.04 或 26.04。刚修完磁盘问题，先固定 24.04 求稳；
     # 想提前验证 26.04，把下面一行改成 runs-on: ubuntu-26.04 即可。
     runs-on: ubuntu-24.04
+    # 整次运行超过 30 分钟即判异常：正常一轮 5~10 分钟，跨境链路挂起时
+    # 旧版单个镜像最多空耗 900 秒，4 个串行就能拖到 80 分钟以上。
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
@@ -109,9 +112,18 @@ jobs:
       # 6. 并行检查镜像状态，然后串行同步需要更新的镜像
       - name: Parallel Check and Sequential Sync
         id: sync_step
+        # 比 job 上限早 3 分钟主动收口，留出清理与 Server酱 通知的时间，
+        # 避免被 30 分钟硬超时直接掐断导致收不到告警。
+        timeout-minutes: 27
         run: |
           echo "=== 开始同步镜像到阿里云 ==="
-          
+
+          # 单镜像 copy 超时：正常最慢的 zstd→gzip 转换约 41 秒，留 7 倍余量。
+          # 跨境连接挂起时 skopeo 不会自己报错，--retry-times 也不会触发，
+          # 只能靠外层 timeout 兜底；旧值 900 秒太保守。
+          COPY_TIMEOUT=300
+          echo "单镜像 copy 超时: ${COPY_TIMEOUT}s | 同步步骤上限: 27min | 整次运行上限: 30min"
+
           # skopeo 仓库到仓库直传，用 --dest-creds 认证，无需 docker login / Docker daemon
           TMPBASE="$RUNNER_TEMP/skopeo-tmp"
           if [ -d /mnt ] && [ "$(stat -c %d /mnt 2>/dev/null)" != "$(stat -c %d /)" ]; then
@@ -502,7 +514,7 @@ jobs:
                       fi
                   fi
 
-                  if timeout 900 "${COPY_CMD[@]}" \
+                  if timeout "$COPY_TIMEOUT" "${COPY_CMD[@]}" \
                        "${HUB_ARGS[@]}" \
                        --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" \
                        "docker://$image" "docker://$new_image"; then
@@ -511,8 +523,15 @@ jobs:
                       SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
                       echo "✅ 同步完成: $image_name_tag"
                   else
-                      echo "  ❌ 同步失败"
-                      SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (同步失败)"
+                      COPY_RC=$?
+                      # 124 = 被 timeout 强杀（连接挂起，通常无任何错误文本）
+                      if [ "$COPY_RC" -eq 124 ]; then
+                          echo "  ⏱ 同步超时（${COPY_TIMEOUT}s），已终止本次 copy"
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (同步超时 ${COPY_TIMEOUT}s)"
+                      else
+                          echo "  ❌ 同步失败 (exit $COPY_RC)"
+                          SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (同步失败 exit $COPY_RC)"
+                      fi
                       FAILURE_COUNT=$((FAILURE_COUNT + 1))
                   fi
 
