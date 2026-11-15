@@ -5,6 +5,7 @@ linuxserver/transmission
 linuxserver/qbittorrent
 linuxserver/qbittorrent:5.1.4
 gdy666/lucky:v2
+gdy666/lucky:v3
 iyuucn/iyuuplus-dev
 emby/embyserver
 emby/embyserver:beta
