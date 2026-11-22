@@ -124,6 +124,11 @@ jobs:
           COPY_TIMEOUT=300
           echo "单镜像 copy 超时: ${COPY_TIMEOUT}s | 同步步骤上限: 27min | 整次运行上限: 30min"
 
+          # 失败明细实时落盘：同步步骤若被 27 分钟上限掐断，$GITHUB_ENV 来不及写，
+          # 通知步骤仍能从这里读出究竟哪些镜像失败了（而不是显示成 0|0|0）。
+          FAIL_LOG="$RUNNER_TEMP/sync_failures.txt"
+          : > "$FAIL_LOG"
+
           # skopeo 仓库到仓库直传，用 --dest-creds 认证，无需 docker login / Docker daemon
           TMPBASE="$RUNNER_TEMP/skopeo-tmp"
           if [ -d /mnt ] && [ "$(stat -c %d /mnt 2>/dev/null)" != "$(stat -c %d /)" ]; then
@@ -528,9 +533,11 @@ jobs:
                       if [ "$COPY_RC" -eq 124 ]; then
                           echo "  ⏱ 同步超时（${COPY_TIMEOUT}s），已终止本次 copy"
                           SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (同步超时 ${COPY_TIMEOUT}s)"
+                          printf -- '- 🚨 %s (同步超时 %ss)\n' "$image_name_tag" "$COPY_TIMEOUT" >> "$FAIL_LOG"
                       else
                           echo "  ❌ 同步失败 (exit $COPY_RC)"
                           SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 $image_name_tag (同步失败 exit $COPY_RC)"
+                          printf -- '- 🚨 %s (同步失败 exit %s)\n' "$image_name_tag" "$COPY_RC" >> "$FAIL_LOG"
                       fi
                       FAILURE_COUNT=$((FAILURE_COUNT + 1))
                   fi
@@ -572,7 +579,7 @@ jobs:
           df -h /
           df -i /
       
-      # 8. 发送 Server酱 微信通知（每次运行都推，包括「无更新」）
+      # 8. 发送 Server酱 微信通知（只在异常时推送：job 失败 / 有镜像失败；正常静默）
       - name: 发送 Server酱 通知
         if: always()
         env:
@@ -588,10 +595,26 @@ jobs:
           F_COUNT="${FAILURE_COUNT:-0}"
           K_COUNT="${SKIP_COUNT:-0}"
 
+          # 只在异常时推送：job 结论非 success，或日志汇总里有失败镜像。
+          # 成功 / 全部跳过 / 仅新增镜像 → 静默，完整汇总仍留在 Action 日志里。
+          if [ "$JOB_STATUS" = "success" ] && [ "$F_COUNT" -eq 0 ]; then
+              echo "✅ 同步正常（成功 $S_COUNT / 跳过 $K_COUNT / 失败 0），按设置不推送微信通知"
+              exit 0
+          fi
+
+          STAT_LINE="📊 **统计**：成功 $S_COUNT ｜ 跳过 $K_COUNT ｜ 失败 $F_COUNT"
+
           # 1. 判定标题与主状态
           if [ "$JOB_STATUS" != "success" ]; then
               TITLE="🚨 同步任务异常终止"
-              CONTENT="工作流状态：$JOB_STATUS，请查看运行日志。"
+              if [ "$S_COUNT" -eq 0 ] && [ "$K_COUNT" -eq 0 ] && [ "$F_COUNT" -eq 0 ]; then
+                  # 同步步骤被超时/取消掐断时 $GITHUB_ENV 来不及写，统计会显示成 0|0|0；
+                  # 明确说明「统计未生成」，避免被误读成「没有失败」。
+                  CONTENT="工作流状态：$JOB_STATUS。同步步骤被中断（多为超时或取消），本轮统计未生成，请查看运行日志确认未完成的镜像。"
+                  STAT_LINE="⚠️ **统计未生成**：同步步骤被中断，以下为已落盘的失败项"
+              else
+                  CONTENT="工作流状态：$JOB_STATUS，请查看运行日志。"
+              fi
           elif [ "$F_COUNT" -gt 0 ]; then
               TITLE="❌ 阿里云镜像同步失败"
               CONTENT="⚠️ 有 $F_COUNT 个镜像同步异常，请及时检查。"
@@ -616,6 +639,12 @@ jobs:
                   | LC_ALL=C grep -E '^(✨|🚨)' \
                   | sed 's/^/- /' || true)
           fi
+          # 同步步骤被掐断时 SYNC_RESULT 未写入，改读实时落盘的失败明细，
+          # 让「异常终止」通知能列出具体卡住的镜像，而不是一片空白。
+          FAIL_LOG="$RUNNER_TEMP/sync_failures.txt"
+          if [ -z "$SYNC_LIST" ] && [ -s "$FAIL_LOG" ]; then
+              SYNC_LIST=$(cat "$FAIL_LOG")
+          fi
           # 打印过滤后的明细，便于在 Action 日志中核对推送内容（不打印 SendKey / URL）
           echo "📋 通知明细（仅新增 / 失败）:"
           printf '%s\n' "${SYNC_LIST:-（本次无新增或失败项）}"
@@ -631,7 +660,7 @@ jobs:
 
           ---
 
-          📊 **统计**：成功 $S_COUNT ｜ 跳过 $K_COUNT ｜ 失败 $F_COUNT
+          $STAT_LINE
           📅 **时间**：$SC_TIME（北京时间）
           🔗 [查看 GitHub Action 日志]($RUN_URL)
           EOF
