@@ -579,7 +579,7 @@ jobs:
           df -h /
           df -i /
       
-      # 8. 发送 Server酱 微信通知（只在异常时推送：job 失败 / 有镜像失败；正常静默）
+      # 8. 发送 Server酱 微信通知（每次运行都推，成功 / 失败 / 全部跳过都发）
       - name: 发送 Server酱 通知
         if: always()
         env:
@@ -594,13 +594,6 @@ jobs:
           S_COUNT="${SUCCESS_COUNT:-0}"
           F_COUNT="${FAILURE_COUNT:-0}"
           K_COUNT="${SKIP_COUNT:-0}"
-
-          # 只在异常时推送：job 结论非 success，或日志汇总里有失败镜像。
-          # 成功 / 全部跳过 / 仅新增镜像 → 静默，完整汇总仍留在 Action 日志里。
-          if [ "$JOB_STATUS" = "success" ] && [ "$F_COUNT" -eq 0 ]; then
-              echo "✅ 同步正常（成功 $S_COUNT / 跳过 $K_COUNT / 失败 0），按设置不推送微信通知"
-              exit 0
-          fi
 
           STAT_LINE="📊 **统计**：成功 $S_COUNT ｜ 跳过 $K_COUNT ｜ 失败 $F_COUNT"
 
