@@ -2,6 +2,11 @@ name: Docker Image Sync to Aliyun
 
 on:
   workflow_dispatch:
+    inputs:
+      auto_retry:
+        description: '青龙「异常兜底重试」标记（仅用于通知说明）'
+        required: false
+        default: 'false'
   schedule:
     # 每周一次兜底：UTC 周三 03:17 = 北京周三 11:17。
     # 主定时由 NAS 青龙面板调 REST API 触发（每天北京 06:17 / 18:17）；
@@ -585,6 +590,7 @@ jobs:
         env:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           JOB_STATUS: ${{ job.status }}
+          AUTO_RETRY: ${{ github.event.inputs.auto_retry || 'false' }}
         run: |
           if [ -z "$SERVERCHAN_SENDKEY" ]; then
               echo "⚠️ 未配置 SERVERCHAN_SENDKEY，跳过微信通知"
@@ -646,8 +652,14 @@ jobs:
           SC_TIME=$(date -u -d '+8 hours' '+%Y-%m-%d %H:%M:%S')
           echo "🕐 通知时间（北京时间）: $SC_TIME"
           # title 参数已由 Server酱 单独显示为消息标题，正文不再重复一次标题
+          RETRY_NOTE=""
+          if [ "$AUTO_RETRY" = "true" ]; then
+              RETRY_NOTE="🔁 **自动兜底重试**：上一轮异常终止约 1 小时后触发，本轮仅重试一次；无论结果如何，都等下次 06:17 / 18:17 正常定时。"
+          fi
           SC_DESP=$(cat <<EOF
           $CONTENT
+
+          $RETRY_NOTE
 
           $SYNC_LIST
 
