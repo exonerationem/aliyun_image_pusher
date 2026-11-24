@@ -74,8 +74,10 @@ ghcr.io/homarr-labs/homarr
 | GitHub `schedule`（兜底） | 仓库自带定时 | 每周三北京 **11:17**（`17 3 * * 3`） |
 | 自动 | push 到 `main` 且**只有 `images.txt` 变更** | 提交后立即 |
 | 手动 | `Actions → Docker Image Sync to Aliyun → Run workflow` | 随时 |
+| 异常兜底重试 | 青龙检查上一轮定时 run，异常才补一次 | 每天北京 **07:47 / 19:47**（只在异常时真正触发） |
 
 - **只用青龙**：注释掉 `docker.yaml` 的 `schedule` 段；**只用 GitHub**：停用青龙任务。
+- **兜底重试**：上一轮异常终止约 1 小时后自动补跑一次，补完无论成败都等下一轮正常定时，详见下方「异常兜底重试」。
 - **同时开启（当前配置）**：青龙为准点主触发，GitHub 每周一次兜底。同步幂等，重复运行只是多一条微信通知。
 - 青龙侧只需环境变量 `GITHUB_PAT`（fine-grained PAT，仅本仓库 `Actions: Read and write`）和任务 `task github_dispatch.sh`。GitHub `schedule` 不保证准点，适合兜底、不适合单独用。
 
@@ -162,6 +164,19 @@ ACR 个人版上传 zstd 层会返回 `unknown: blob type invalid`。上游 `diy
 巡检在 NAS 青龙容器内运行，**不依赖 PC 开机**，只要 NAS / 青龙在线即可。环境变量只需 `GITHUB_PAT`（与触发脚本共用）；告警 SendKey 按 `SERVERCHAN_SENDKEY` → 青龙自带 `PUSH_KEY`（面板「通知设置」里的 Server酱 Turbo SendKey，本机已配置）→ `SCKEY` 顺序自动读取，**通常无需新建环境变量**；三者都为空时降级为「只写青龙日志 + 任务标红」。可用 `PATROL_DRY_RUN=1` / `PATROL_TEST=1` 演练，不产生真实告警。
 
 > ⚠️ 原 WorkBuddy 本机 automation「镜像同步失败巡检」已暂停（保留配置可随时恢复），避免与青龙重复巡检。
+
+## 🔁 异常兜底重试（仅一次）
+
+青龙面板任务 **1378「GitHub 同步异常兜底重试」**（`task github_retry.sh`，cron `47 7,19 * * *`，容器为北京时间）每天 **07:47 / 19:47** 执行，距 06:17 / 18:17 那轮正常定时 90 分钟（异常多在 18:47 被 30 分钟上限掐断，约 1 小时后补跑）：
+
+- 只检查「90 分钟前那一轮正常定时」创建的 run（±20 分钟窗口），取窗口内**最新**一条；
+- 结论 `success` → 跳过；窗口内没有 run（定时没跑）→ 跳过，这类静默故障由每日巡检负责；
+- 结论非 `success`（`failure` / `cancelled` / `timed_out`）或仍未完成 → 触发**一次** `workflow_dispatch` 补跑；
+- **不会循环重试**：检查窗口锚定在正常定时时刻，补跑自己产生的 run 永远落不进下一次窗口。补跑无论成功失败，下一次动作都是 06:17 / 18:17 的正常定时。
+
+补跑带 `auto_retry=true` 输入，微信通知正文会多一行「🔁 自动兜底重试」说明（**标题不变**），结果通知照旧每次都发。脚本复用 `GITHUB_PAT`，无需新增环境变量；可用 `RETRY_DRY_RUN=1` 演练、`RETRY_CHECK_AT`（UTC ISO）模拟检查时刻。若带标记的触发被 GitHub 拒绝，会自动降级成不带 inputs 的纯触发，保证补跑本身不受影响。
+
+> ⚠️ 若青龙恰好在 07:47 / 19:47 停机，这一轮补跑会错过，直接等下一轮正常定时；这是兜底而非准点保证。错过检查点后手动运行任务也不会补跑旧 run。
 
 ## ⚠️ 已知限制
 
