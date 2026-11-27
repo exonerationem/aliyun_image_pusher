@@ -69,5 +69,6 @@ winglini/juku
 cs920/happy-capy
 wabisabi926/faststrm
 mdcng/mdc
+leolitaly/mdc-ngi
 dbonline/db_online
 leolitaly/avdb
